@@ -286,6 +286,14 @@ D3D11_TEXTURE2D_DESC g_VmDepthDesc = {};
 DXGI_FORMAT g_VmDsvFormat = DXGI_FORMAT_UNKNOWN;
 uint32_t g_VmDepthFrame = 0xFFFFFFFFu;
 int g_VmDepthRun = -1;             // the run g_VmDepthFrame's preparation was for
+// Our viewmodel depth is reset when the engine clears the main depth, not at
+// every run: a run boundary can fall inside the weapon's own draws (a shot or
+// a turn adds a run), and a reset there cleared the depth of the meshes drawn
+// before it - the next ones landed over them, the weapon "turned inside out"
+// for a frame (2026-10-16, Scout with galaxy). Counted: kept across a run.
+uint32_t g_MainDepthClears = 0;    // depth clears of the main depth so far (render thread)
+uint32_t g_VmDepthClearGen = ~0u;  // g_MainDepthClears at the last preparation
+std::atomic<uint32_t> g_VmDepthKeptAcrossRun{0};
 bool g_VmDepthReady = false;       // prepared for g_VmDepthFrame
 ID3D11DepthStencilState* g_DsPre = nullptr;   // depth-only pass: LESS_EQUAL, write, no stencil
 ID3D11DepthStencilState* g_DsFx = nullptr;    // our colour pass: LESS_EQUAL, no write, no stencil
@@ -1311,9 +1319,13 @@ void ReleaseVmDepth() {
 // the stencil the prepass marked) and depth cleared to the far plane. False
 // leaves the frame to the engine's own depth.
 bool PrepareVmDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* mainDsv, uint32_t frame) {
-    if (g_VmDepthFrame == frame && g_VmDepthRun == g_Run) return g_VmDepthReady;
+    if (g_VmDepthFrame == frame && g_VmDepthClearGen == g_MainDepthClears) {
+        if (g_VmDepthRun != g_Run) { g_VmDepthRun = g_Run; g_VmDepthKeptAcrossRun.fetch_add(1, std::memory_order_relaxed); }
+        return g_VmDepthReady;
+    }
     g_VmDepthFrame = frame;
     g_VmDepthRun = g_Run;
+    g_VmDepthClearGen = g_MainDepthClears;
     g_VmDepthReady = false;
     ID3D11Resource* r = nullptr;
     mainDsv->GetResource(&r);
@@ -1825,6 +1837,12 @@ void BeforeClearDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, unsig
         }
         return;
     }
+    if (dsv && c == g_TrackCtx && g_MainDsv) {
+        ID3D11Resource* r = nullptr;
+        dsv->GetResource(&r);
+        if (r) r->Release();
+        if (r == g_MainDsv) ++g_MainDepthClears;
+    }
     if (!dsv || !g_Ps.load(std::memory_order_relaxed) || !g_PsUsesDepth.load(std::memory_order_relaxed)) return;
     if (c != g_TrackCtx || !g_MainDsv) return;
     const uint32_t frame = g_Frame.load(std::memory_order_relaxed);
@@ -2072,10 +2090,10 @@ void Report() {
          g_ShadowAgreeAll.load(), g_ShadowWrongAll.load(), g_ShadowNoneAll.load(), g_EventsEarly.load(),
          g_LateStarts.load(), g_VbOnlyRefused.load(), g_CoveredFrames.load(), g_Relearns.load(), g_PredictedRun);
     Logf("WeaponFX: prepass draws dropped %u (weapon buffers %d), marker passes dropped %u | "
-         "viewmodel depth %s: draws %u, depth passes %u, failures %u, weapon draws outside the run %u",
+         "viewmodel depth %s: draws %u, depth passes %u, failures %u, weapon draws outside the run %u, kept across a run %u",
          g_PrepassSkips.load(), g_VmVbCount[g_VmVbCur ^ 1], g_MarkerPassSkips.load(),
          g_VmDepthOn.load() ? "on" : "off", g_VmDepthDraws.load(), g_VmDepthPre.load(), g_VmDepthFails.load(),
-         g_MissDepthDraws.load());
+         g_MissDepthDraws.load(), g_VmDepthKeptAcrossRun.load());
 }
 
 } // namespace WeaponFx
