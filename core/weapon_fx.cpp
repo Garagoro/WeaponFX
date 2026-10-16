@@ -1324,7 +1324,8 @@ void ReleaseVmDepth() {
 // target, each with its own texture - one texture for both shapes was the
 // rebuild ping-pong that tripped the creation fuse (2026-10-16).
 bool FillDepthLike(ID3D11DeviceContext* c, ID3D11DepthStencilView* srcDsv, ID3D11Texture2D*& tex,
-                   ID3D11DepthStencilView*& dsv, D3D11_TEXTURE2D_DESC& desc, DXGI_FORMAT& viewFmt, const char* what) {
+                   ID3D11DepthStencilView*& dsv, D3D11_TEXTURE2D_DESC& desc, DXGI_FORMAT& viewFmt, const char* what,
+                   bool keepDepth) {
     ID3D11Resource* r = nullptr;
     srcDsv->GetResource(&r);
     ID3D11Texture2D* src = nullptr;
@@ -1362,7 +1363,7 @@ bool FillDepthLike(ID3D11DeviceContext* c, ID3D11DepthStencilView* srcDsv, ID3D1
     }
     c->CopyResource(tex, src);
     src->Release();
-    c->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+    if (!keepDepth) c->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
     return true;
 }
 
@@ -1374,14 +1375,17 @@ bool PrepareVmDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* mainDsv, uin
     g_VmDepthFrame = frame;
     g_VmDepthRun = g_Run;
     g_VmDepthClearGen = g_MainDepthClears;
-    g_VmDepthReady = FillDepthLike(c, mainDsv, g_VmDepthTex, g_VmDsv, g_VmDepthDesc, g_VmDsvFormat, "viewmodel depth");
+    g_VmDepthReady = FillDepthLike(c, mainDsv, g_VmDepthTex, g_VmDsv, g_VmDepthDesc, g_VmDsvFormat, "viewmodel depth", false);
     return g_VmDepthReady;
 }
 
 // Weapon draws on the screen target but with another depth target bound
-// (1510x849 viewport against a 2560 screen, 1-4 frames a second, 2026-10-16):
-// they went out with the marker's no depth test and the weapon turned inside
-// out. They get a depth buffer of their own, once per frame per target.
+// (1510x849 viewport against a 2560 screen, 1-4 frames a second, 2026-10-16 -
+// most likely the game's FSR "balanced" pass, 59%): they went out with the
+// marker's no depth test and the weapon turned inside out. They get a depth
+// buffer of their own, once per frame per target - a copy of that target's
+// depth as it is, not cleared: the hands of that pass are drawn into it
+// before the weapon, and a cleared copy put the knife over the fingers.
 ID3D11Texture2D* g_OtherDepthTex = nullptr;
 ID3D11DepthStencilView* g_OtherDsv = nullptr;
 D3D11_TEXTURE2D_DESC g_OtherDepthDesc = {};
@@ -1404,7 +1408,7 @@ bool PrepareOtherDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, cons
         Logf("WeaponFX: weapon drawn with another depth target %p, viewport %.0fx%.0f at %.0f,%.0f", res, vp.Width,
              vp.Height, vp.TopLeftX, vp.TopLeftY);
     }
-    g_OtherDepthReady = FillDepthLike(c, dsv, g_OtherDepthTex, g_OtherDsv, g_OtherDepthDesc, g_OtherDsvFormat, "other depth");
+    g_OtherDepthReady = FillDepthLike(c, dsv, g_OtherDepthTex, g_OtherDsv, g_OtherDepthDesc, g_OtherDsvFormat, "other depth", true);
     return g_OtherDepthReady;
 }
 
