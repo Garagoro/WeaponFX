@@ -1605,8 +1605,19 @@ bool FillDepthLike(ID3D11DeviceContext* c, ID3D11DepthStencilView* srcDsv, ID3D1
     return true;
 }
 
+// A frame whose viewmodel was started late, at the weapon's own marked draw:
+// the hands are already in the main depth by then, and not in a cleared
+// buffer - the knife went over the fingers on such frames (2026-10-16, a
+// stencil event refused as too early). That frame's viewmodel depth is a copy
+// of the main depth as it is; the viewmodel's depth sits in front of the
+// world's, so the world in it hides nothing of the weapon.
+uint32_t g_LateStartFrame = ~0u;
+bool g_VmDepthKept = false;           // the current preparation is such a copy
+std::atomic<uint32_t> g_VmDepthLateKept{0};
+
 bool PrepareVmDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* mainDsv, uint32_t frame) {
-    if (g_VmDepthFrame == frame && g_VmDepthClearGen == g_MainDepthClears) {
+    const bool late = g_LateStartFrame == frame;
+    if (g_VmDepthFrame == frame && g_VmDepthClearGen == g_MainDepthClears && (!late || g_VmDepthKept)) {
         if (g_VmDepthEarly) { g_VmDepthEarly = false; g_VmDepthRun = g_Run; }
         if (g_VmDepthRun != g_Run) { g_VmDepthRun = g_Run; g_VmDepthKeptAcrossRun.fetch_add(1, std::memory_order_relaxed); }
         return g_VmDepthReady;
@@ -1614,10 +1625,13 @@ bool PrepareVmDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* mainDsv, uin
     g_VmDepthFrame = frame;
     g_VmDepthRun = g_Run;
     g_VmDepthClearGen = g_MainDepthClears;
-    const bool known = g_StencilClearFrame == frame && g_StencilClearGen == g_MainDepthClears;
-    g_VmDepthReady = FillDepthLike(c, mainDsv, g_VmDepthTex, g_VmDsv, g_VmDepthDesc, g_VmDsvFormat, "viewmodel depth", false,
+    g_VmDepthEarly = false;
+    g_VmDepthKept = late;
+    const bool known = !late && g_StencilClearFrame == frame && g_StencilClearGen == g_MainDepthClears;
+    g_VmDepthReady = FillDepthLike(c, mainDsv, g_VmDepthTex, g_VmDsv, g_VmDepthDesc, g_VmDsvFormat, "viewmodel depth", late,
                                    known ? (int)g_StencilClearValue : -1);
-    if (g_VmDepthReady) (known ? g_VmDepthCleared : g_VmDepthCopiedAll).fetch_add(1, std::memory_order_relaxed);
+    if (g_VmDepthReady)
+        (late ? g_VmDepthLateKept : known ? g_VmDepthCleared : g_VmDepthCopiedAll).fetch_add(1, std::memory_order_relaxed);
     ID3D11Resource* r = nullptr;
     mainDsv->GetResource(&r);
     if (r) r->Release();
@@ -1639,6 +1653,7 @@ DXGI_FORMAT g_OtherDsvFormat = DXGI_FORMAT_UNKNOWN;
 uint32_t g_OtherDepthFrame = ~0u;
 const void* g_OtherDepthSrc = nullptr;   // compared only
 const void* g_OtherDepthLogged = nullptr;
+ULONGLONG g_MissMainLogAt = 0;
 bool g_OtherDepthReady = false;
 std::atomic<uint32_t> g_OtherDepthDraws{0};
 
@@ -1646,13 +1661,18 @@ bool PrepareOtherDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, cons
     if (g_OtherDepthFrame == frame && g_OtherDepthSrc == res) return g_OtherDepthReady;
     g_OtherDepthFrame = frame;
     g_OtherDepthSrc = res;
-    if (g_OtherDepthLogged != res) {
+    // The main depth here is a frame whose viewmodel start was not found:
+    // logged at most once a second, to line up with a blink the user saw.
+    const ULONGLONG now = GetTickCount64();
+    if (g_OtherDepthLogged != res || (res == g_MainDsv && now >= g_MissMainLogAt)) {
         g_OtherDepthLogged = res;
+        if (res == g_MainDsv) g_MissMainLogAt = now + 1000;
         D3D11_VIEWPORT vp = {};
         UINT nvp = 1;
         c->RSGetViewports(&nvp, &vp);
-        Logf("WeaponFX: weapon drawn with another depth target %p, viewport %.0fx%.0f at %.0f,%.0f", res, vp.Width,
-             vp.Height, vp.TopLeftX, vp.TopLeftY);
+        Logf("WeaponFX: weapon drawn %s %p, viewport %.0fx%.0f at %.0f,%.0f - given a copy of it",
+             res == g_MainDsv ? "outside the viewmodel run, on the main depth" : "with another depth target", res,
+             vp.Width, vp.Height, vp.TopLeftX, vp.TopLeftY);
     }
     g_OtherDepthReady = FillDepthLike(c, dsv, g_OtherDepthTex, g_OtherDsv, g_OtherDepthDesc, g_OtherDsvFormat, "other depth", true);
     return g_OtherDepthReady;
@@ -1687,6 +1707,7 @@ bool InViewmodelRun(ID3D11DeviceContext* c, ID3D11DepthStencilView** mainDsv) {
 }
 
 std::atomic<uint32_t> g_MissDepthDraws{0};
+std::atomic<uint32_t> g_MissMainDepthDraws{0};   // of them on the main depth (no viewmodel start that frame)
 
 // The weapon's depth-only pass, with no pixel shader: no target is bound, so
 // the marker's shader would only be run for nothing - drivers may skip it,
@@ -1706,10 +1727,14 @@ void IssueDepthOnly(ID3D11DeviceContext* c, IssueFn issue, void* ctx) {
 // with an opaque effect: the marker material has no depth test, so without
 // this its far side lands on top of its near side - the weapon "turns inside
 // out" for that frame (2026-10-16, plasma and others, now and then). It gets
-// our viewmodel depth for that frame instead: the main depth's stencil, depth
-// cleared, a depth-only pass, then our colour pass against it. The hands are
-// not in it, so for that one frame the weapon is drawn over the fingers - far
-// less visible than inside out. False: nothing done, the caller draws as before.
+// a copy of the depth target it is drawn with, as it is, then a depth-only
+// pass, then our colour pass against it. As is, not cleared: the hands were
+// drawn into that depth before the weapon, and our cleared viewmodel depth
+// put the knife over the fingers on such frames (2026-10-16, the stencil event
+// refused as too early - a frame with half last frame's screen draws before
+// it). The viewmodel's depth sits in front of the world's, as in the game,
+// so the world in the copy does not hide the weapon.
+// False: nothing done, the caller draws as before.
 // Why a weapon draw went out without our depth (the inside-out risk), for the
 // depth watch line. Index into kNoDepthWhy.
 enum NoDepthWhy { kWhyOff, kWhyScene, kWhyNotScreen, kWhyNotMainDepth, kWhyPrepare, kWhyCount };
@@ -1746,8 +1771,10 @@ bool DrawMissedWeapon(ID3D11DeviceContext* c, IssueFn issue, void* ctx, bool* on
     *why = !rt || !g_MainRt || rt != g_MainRt ? kWhyNotScreen : !ds0 ? kWhyNotMainDepth : kWhyPrepare;
     ID3D11DepthStencilView* ours = nullptr;
     if (*why == kWhyPrepare) {
-        if (ds0 == g_MainDsv) { if (PrepareVmDepth(c, dsv, frame)) ours = g_VmDsv; }
-        else if (PrepareOtherDepth(c, dsv, ds0, frame)) { ours = g_OtherDsv; g_OtherDepthDraws.fetch_add(1, std::memory_order_relaxed); }
+        if (PrepareOtherDepth(c, dsv, ds0, frame)) {
+            ours = g_OtherDsv;
+            (ds0 == g_MainDsv ? g_MissMainDepthDraws : g_OtherDepthDraws).fetch_add(1, std::memory_order_relaxed);
+        }
     }
     if (!ours) {
         release();
@@ -2097,7 +2124,8 @@ bool BeforeDraw(ID3D11DeviceContext* c, bool weapon) {
     // test on the screen target, ours or the engine's pass of it. Without it
     // such a frame has no copy at all: the black blink while turning
     // (2026-10-16). It starts late: the hand pieces drawn before the weapon
-    // are not in our viewmodel depth that frame.
+    // are in the main depth only, so that frame's viewmodel depth is a copy of
+    // it as it is (g_LateStartFrame, PrepareVmDepth).
     //
     // A marked draw only. The weapon's vertex buffer is a pool the world is
     // drawn from too (the set holds one buffer), and a match on it alone
@@ -2115,6 +2143,7 @@ bool BeforeDraw(ID3D11DeviceContext* c, bool weapon) {
                 Logf("WeaponFX: late viewmodel start at a marked draw #%d of ~%d, run %d (stencil event this frame: %s)",
                      g_DbgDrawIdx - 1, g_DbgDrawsLastFrame, g_Run, g_StencilClearFrame == frame ? "seen" : "none");
             }
+            g_LateStartFrame = frame;
             StartViewmodel(c, frame);
             g_LateStarts.fetch_add(1, std::memory_order_relaxed);
         } else if (g_VmVbCount[set] && InSet(g_VmVb[set], g_VmVbCount[set], BoundVb0(c)) &&
@@ -2504,9 +2533,11 @@ void Report() {
          g_PrepassSkips.load(), g_VmVbCount[g_VmVbCur ^ 1], g_MarkerPassSkips.load(),
          g_VmDepthOn.load() ? "on" : "off", g_VmDepthDraws.load(), g_VmDepthPre.load(), g_VmDepthFails.load(),
          g_MissDepthDraws.load(), g_VmDepthKeptAcrossRun.load());
-    Logf("WeaponFX: weapon draws on another depth target, given a depth of their own %u", g_OtherDepthDraws.load());
-    Logf("WeaponFX: viewmodel depth made at the game's stencil clear %u, by a clear at the first draw %u, by a copy %u",
-         g_VmDepthEarlyAll.load(), g_VmDepthCleared.load(), g_VmDepthCopiedAll.load());
+    Logf("WeaponFX: weapon draws on another depth target, given a depth of their own %u; on the main depth with no viewmodel start %u",
+         g_OtherDepthDraws.load(), g_MissMainDepthDraws.load());
+    Logf("WeaponFX: viewmodel depth made at the game's stencil clear %u, by a clear at the first draw %u, by a copy %u, "
+         "kept as it is for a late start %u",
+         g_VmDepthEarlyAll.load(), g_VmDepthCleared.load(), g_VmDepthCopiedAll.load(), g_VmDepthLateKept.load());
     Logf("WeaponFX: weapon frames without our depth (not scene readers) %u", g_NoDepthAll.load());
 }
 
