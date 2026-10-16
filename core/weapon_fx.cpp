@@ -1318,6 +1318,54 @@ void ReleaseVmDepth() {
 // depth buffer of the same shape, with the main one's stencil (the hands test
 // the stencil the prepass marked) and depth cleared to the far plane. False
 // leaves the frame to the engine's own depth.
+// A depth buffer of ours shaped like `src`'s texture, holding its stencil and
+// cleared depth: (re)made when the shape changes, then copied and cleared.
+// Shared by the viewmodel depth and the one for weapon draws on another depth
+// target, each with its own texture - one texture for both shapes was the
+// rebuild ping-pong that tripped the creation fuse (2026-10-16).
+bool FillDepthLike(ID3D11DeviceContext* c, ID3D11DepthStencilView* srcDsv, ID3D11Texture2D*& tex,
+                   ID3D11DepthStencilView*& dsv, D3D11_TEXTURE2D_DESC& desc, DXGI_FORMAT& viewFmt, const char* what) {
+    ID3D11Resource* r = nullptr;
+    srcDsv->GetResource(&r);
+    ID3D11Texture2D* src = nullptr;
+    if (r) { r->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&src); r->Release(); }
+    if (!src) return false;
+    D3D11_TEXTURE2D_DESC sd = {};
+    src->GetDesc(&sd);
+    D3D11_DEPTH_STENCIL_VIEW_DESC vd = {};
+    srcDsv->GetDesc(&vd);
+    if (!dsv || desc.Width != sd.Width || desc.Height != sd.Height || desc.Format != sd.Format ||
+        desc.SampleDesc.Count != sd.SampleDesc.Count || viewFmt != vd.Format) {
+        if (dsv) { dsv->Release(); dsv = nullptr; }
+        if (tex) { tex->Release(); tex = nullptr; }
+        desc = {};
+        viewFmt = DXGI_FORMAT_UNKNOWN;
+        if (sd.ArraySize != 1 || sd.MipLevels != 1 || !CreationAllowed(what)) { src->Release(); return false; }
+        D3D11_TEXTURE2D_DESC td = sd;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_DEPTH_STENCIL;   // CopyResource needs the format, not the bindings
+        td.CPUAccessFlags = 0;
+        td.MiscFlags = 0;
+        vd.Flags = 0;
+        if (FAILED(g_Dev->CreateTexture2D(&td, nullptr, &tex)) || !tex ||
+            FAILED(g_Dev->CreateDepthStencilView(tex, &vd, &dsv)) || !dsv) {
+            if (dsv) { dsv->Release(); dsv = nullptr; }
+            if (tex) { tex->Release(); tex = nullptr; }
+            src->Release();
+            g_VmDepthFails.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        desc = sd;
+        viewFmt = vd.Format;
+        g_CopyCreates.fetch_add(1, std::memory_order_relaxed);
+        Logf("WeaponFX: %s %ux%u format %d (view %d)", what, sd.Width, sd.Height, (int)sd.Format, (int)vd.Format);
+    }
+    c->CopyResource(tex, src);
+    src->Release();
+    c->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+    return true;
+}
+
 bool PrepareVmDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* mainDsv, uint32_t frame) {
     if (g_VmDepthFrame == frame && g_VmDepthClearGen == g_MainDepthClears) {
         if (g_VmDepthRun != g_Run) { g_VmDepthRun = g_Run; g_VmDepthKeptAcrossRun.fetch_add(1, std::memory_order_relaxed); }
@@ -1326,44 +1374,48 @@ bool PrepareVmDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* mainDsv, uin
     g_VmDepthFrame = frame;
     g_VmDepthRun = g_Run;
     g_VmDepthClearGen = g_MainDepthClears;
-    g_VmDepthReady = false;
-    ID3D11Resource* r = nullptr;
-    mainDsv->GetResource(&r);
-    ID3D11Texture2D* src = nullptr;
-    if (r) { r->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&src); r->Release(); }
-    if (!src) return false;
-    D3D11_TEXTURE2D_DESC sd = {};
-    src->GetDesc(&sd);
-    D3D11_DEPTH_STENCIL_VIEW_DESC vd = {};
-    mainDsv->GetDesc(&vd);
-    if (!g_VmDsv || g_VmDepthDesc.Width != sd.Width || g_VmDepthDesc.Height != sd.Height ||
-        g_VmDepthDesc.Format != sd.Format || g_VmDepthDesc.SampleDesc.Count != sd.SampleDesc.Count ||
-        g_VmDsvFormat != vd.Format) {
-        ReleaseVmDepth();
-        if (sd.ArraySize != 1 || sd.MipLevels != 1 || !CreationAllowed("viewmodel depth")) { src->Release(); return false; }
-        D3D11_TEXTURE2D_DESC td = sd;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_DEPTH_STENCIL;   // CopyResource needs the format, not the bindings
-        td.CPUAccessFlags = 0;
-        td.MiscFlags = 0;
-        vd.Flags = 0;
-        if (FAILED(g_Dev->CreateTexture2D(&td, nullptr, &g_VmDepthTex)) || !g_VmDepthTex ||
-            FAILED(g_Dev->CreateDepthStencilView(g_VmDepthTex, &vd, &g_VmDsv)) || !g_VmDsv) {
-            ReleaseVmDepth();
-            src->Release();
-            g_VmDepthFails.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
-        g_VmDepthDesc = sd;
-        g_VmDsvFormat = vd.Format;
-        g_CopyCreates.fetch_add(1, std::memory_order_relaxed);
-        Logf("WeaponFX: viewmodel depth %ux%u format %d (view %d)", sd.Width, sd.Height, (int)sd.Format, (int)vd.Format);
+    g_VmDepthReady = FillDepthLike(c, mainDsv, g_VmDepthTex, g_VmDsv, g_VmDepthDesc, g_VmDsvFormat, "viewmodel depth");
+    return g_VmDepthReady;
+}
+
+// Weapon draws on the screen target but with another depth target bound
+// (1510x849 viewport against a 2560 screen, 1-4 frames a second, 2026-10-16):
+// they went out with the marker's no depth test and the weapon turned inside
+// out. They get a depth buffer of their own, once per frame per target.
+ID3D11Texture2D* g_OtherDepthTex = nullptr;
+ID3D11DepthStencilView* g_OtherDsv = nullptr;
+D3D11_TEXTURE2D_DESC g_OtherDepthDesc = {};
+DXGI_FORMAT g_OtherDsvFormat = DXGI_FORMAT_UNKNOWN;
+uint32_t g_OtherDepthFrame = ~0u;
+const void* g_OtherDepthSrc = nullptr;   // compared only
+const void* g_OtherDepthLogged = nullptr;
+bool g_OtherDepthReady = false;
+std::atomic<uint32_t> g_OtherDepthDraws{0};
+
+bool PrepareOtherDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, const void* res, uint32_t frame) {
+    if (g_OtherDepthFrame == frame && g_OtherDepthSrc == res) return g_OtherDepthReady;
+    g_OtherDepthFrame = frame;
+    g_OtherDepthSrc = res;
+    if (g_OtherDepthLogged != res) {
+        g_OtherDepthLogged = res;
+        D3D11_VIEWPORT vp = {};
+        UINT nvp = 1;
+        c->RSGetViewports(&nvp, &vp);
+        Logf("WeaponFX: weapon drawn with another depth target %p, viewport %.0fx%.0f at %.0f,%.0f", res, vp.Width,
+             vp.Height, vp.TopLeftX, vp.TopLeftY);
     }
-    c->CopyResource(g_VmDepthTex, src);
-    src->Release();
-    c->ClearDepthStencilView(g_VmDsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
-    g_VmDepthReady = true;
-    return true;
+    g_OtherDepthReady = FillDepthLike(c, dsv, g_OtherDepthTex, g_OtherDsv, g_OtherDepthDesc, g_OtherDsvFormat, "other depth");
+    return g_OtherDepthReady;
+}
+
+void ReleaseOtherDepth() {
+    if (g_OtherDsv) { g_OtherDsv->Release(); g_OtherDsv = nullptr; }
+    if (g_OtherDepthTex) { g_OtherDepthTex->Release(); g_OtherDepthTex = nullptr; }
+    g_OtherDepthDesc = {};
+    g_OtherDsvFormat = DXGI_FORMAT_UNKNOWN;
+    g_OtherDepthFrame = ~0u;
+    g_OtherDepthSrc = nullptr;
+    g_OtherDepthReady = false;
 }
 
 // The draw belongs to the viewmodel run copied this frame and targets the
@@ -1394,11 +1446,18 @@ std::atomic<uint32_t> g_MissDepthDraws{0};
 // cleared, a depth-only pass, then our colour pass against it. The hands are
 // not in it, so for that one frame the weapon is drawn over the fingers - far
 // less visible than inside out. False: nothing done, the caller draws as before.
-bool DrawMissedWeapon(ID3D11DeviceContext* c, IssueFn issue, void* ctx, bool* on) {
+// Why a weapon draw went out without our depth (the inside-out risk), for the
+// depth watch line. Index into kNoDepthWhy.
+enum NoDepthWhy { kWhyOff, kWhyScene, kWhyNotScreen, kWhyNotMainDepth, kWhyPrepare, kWhyCount };
+const char* const kNoDepthWhy[kWhyCount] = { "depth off or no shader", "scene reader (by design)", "another colour target",
+                                             "another depth target", "depth buffer not prepared" };
+
+bool DrawMissedWeapon(ID3D11DeviceContext* c, IssueFn issue, void* ctx, bool* on, int* why) {
     *on = false;
-    if (!g_VmDepthOn.load(std::memory_order_relaxed) || !g_DsPre || !g_DsFx || g_PsUsesScene.load(std::memory_order_relaxed) ||
-        !g_Ps.load(std::memory_order_acquire))
+    *why = kWhyOff;
+    if (!g_VmDepthOn.load(std::memory_order_relaxed) || !g_DsPre || !g_DsFx || !g_Ps.load(std::memory_order_acquire))
         return false;
+    if (g_PsUsesScene.load(std::memory_order_relaxed)) { *why = kWhyScene; return false; }
     ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     ID3D11DepthStencilView* dsv = nullptr;
     c->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, &dsv);
@@ -1419,18 +1478,24 @@ bool DrawMissedWeapon(ID3D11DeviceContext* c, IssueFn issue, void* ctx, bool* on
     if (dsv) dsv->GetResource(&ds0);
     if (rt) rt->Release();     // compared only
     if (ds0) ds0->Release();
-    if (!rt || !ds0 || !g_MainRt || rt != g_MainRt || ds0 != g_MainDsv ||
-        !PrepareVmDepth(c, dsv, g_Frame.load(std::memory_order_relaxed))) {
+    const uint32_t frame = g_Frame.load(std::memory_order_relaxed);
+    *why = !rt || !g_MainRt || rt != g_MainRt ? kWhyNotScreen : !ds0 ? kWhyNotMainDepth : kWhyPrepare;
+    ID3D11DepthStencilView* ours = nullptr;
+    if (*why == kWhyPrepare) {
+        if (ds0 == g_MainDsv) { if (PrepareVmDepth(c, dsv, frame)) ours = g_VmDsv; }
+        else if (PrepareOtherDepth(c, dsv, ds0, frame)) { ours = g_OtherDsv; g_OtherDepthDraws.fetch_add(1, std::memory_order_relaxed); }
+    }
+    if (!ours) {
         release();
         return false;
     }
     ID3D11DepthStencilState* ds = nullptr;
     UINT ref = 0;
     c->OMGetDepthStencilState(&ds, &ref);
-    c->OMSetRenderTargets(0, nullptr, g_VmDsv);
+    c->OMSetRenderTargets(0, nullptr, ours);
     c->OMSetDepthStencilState(g_DsPre, 0);
     issue(ctx);
-    c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, g_VmDsv);
+    c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, ours);
     Bound fx;
     *on = Begin(c, fx);
     c->OMSetDepthStencilState(g_DsFx, 0);
@@ -1442,6 +1507,41 @@ bool DrawMissedWeapon(ID3D11DeviceContext* c, IssueFn issue, void* ctx, bool* on
     release();
     g_MissDepthDraws.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+// Depth watch: frames where a weapon draw with our effect went out with no
+// depth test of ours, by reason - the frames the weapon can turn inside out.
+// Only draws on a screen-wide target count (a weapon in a reflection or a
+// small pass is not the one in hands). One line a second when non-zero.
+uint32_t g_NoDepthFrame = ~0u, g_NoDepthFrames[kWhyCount] = {};
+ULONGLONG g_NoDepthNext = 0;
+std::atomic<uint32_t> g_NoDepthAll{0};
+
+void NoteNoDepth(ID3D11DeviceContext* c, int why) {
+    D3D11_VIEWPORT vp = {};
+    UINT nvp = 1;
+    c->RSGetViewports(&nvp, &vp);
+    static float s_widest = 0.0f;   // the widest viewport a weapon draw had: the screen
+    if (!nvp) return;
+    if (vp.Width > s_widest) s_widest = vp.Width;
+    if (vp.Width < s_widest * 0.9f) return;
+    const uint32_t frame = g_Frame.load(std::memory_order_relaxed);
+    if (g_NoDepthFrame != frame) {
+        g_NoDepthFrame = frame;
+        ++g_NoDepthFrames[why];
+        if (why != kWhyScene) g_NoDepthAll.fetch_add(1, std::memory_order_relaxed);
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_NoDepthNext) return;
+    g_NoDepthNext = now + 1000;
+    char line[512];
+    int n = 0;
+    for (int k = 0; k < kWhyCount; ++k)
+        if (k != kWhyScene && g_NoDepthFrames[k])
+            n += _snprintf_s(line + n, sizeof(line) - n, _TRUNCATE, "%s%s %u", n ? ", " : "", kNoDepthWhy[k], g_NoDepthFrames[k]);
+    if (n) Logf("WeaponFX: depth watch - weapon frames without our depth: %s (run %d, predicted %d, viewport %.0fx%.0f)", line,
+                g_Run, g_PredictedRun, vp.Width, vp.Height);
+    memset(g_NoDepthFrames, 0, sizeof(g_NoDepthFrames));
 }
 
 } // namespace
@@ -1528,6 +1628,7 @@ void Shutdown() {
     ReleaseSlots(g_DbgDepthSlots);
     ReleaseSlots(g_DbgSceneSlots);
     Hold(g_DbgSceneSrv, nullptr);
+    ReleaseOtherDepth();
     ReleaseVmDepth();
     RingRelease();
     g_RingState.store(0);
@@ -1989,8 +2090,10 @@ bool Draw(ID3D11DeviceContext* c, bool weapon, IssueFn issue, void* ctx) {
     ID3D11DepthStencilView* mainDsv = nullptr;
     if (!InViewmodelRun(c, &mainDsv)) {
         bool drawn = false;
-        if (weapon && DrawMissedWeapon(c, issue, ctx, &drawn)) return drawn;
+        int why = kWhyOff;
+        if (weapon && DrawMissedWeapon(c, issue, ctx, &drawn, &why)) return drawn;
         const bool on = weapon && Begin(c, fx);
+        if (on) NoteNoDepth(c, why);
         issue(ctx);
         End(c, fx);
         return on;
@@ -2094,6 +2197,8 @@ void Report() {
          g_PrepassSkips.load(), g_VmVbCount[g_VmVbCur ^ 1], g_MarkerPassSkips.load(),
          g_VmDepthOn.load() ? "on" : "off", g_VmDepthDraws.load(), g_VmDepthPre.load(), g_VmDepthFails.load(),
          g_MissDepthDraws.load(), g_VmDepthKeptAcrossRun.load());
+    Logf("WeaponFX: weapon draws on another depth target, given a depth of their own %u", g_OtherDepthDraws.load());
+    Logf("WeaponFX: weapon frames without our depth (not scene readers) %u", g_NoDepthAll.load());
 }
 
 } // namespace WeaponFx
