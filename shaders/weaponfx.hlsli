@@ -93,6 +93,19 @@ float3 SceneAt(PSIn i, float2 offsetPx) {
     return c;
 }
 
+// SceneAt for big shifts: a read that lands on pure black (behind a hand drawn
+// after the copy, where the world is never drawn) steps back towards this
+// pixel - half, a quarter, then unshifted - instead of painting black. Every
+// effect that bends the world by more than a few pixels wants this one.
+float3 SceneAtSafe(PSIn i, float2 offsetPx) {
+    float3 c = SceneAt(i, offsetPx);
+    [unroll] for (int k = 0; k < 3; ++k) {
+        if (dot(c, c) >= 1e-6) break;
+        c = SceneAt(i, offsetPx * (k == 2 ? 0.0 : (k == 0 ? 0.5 : 0.25)));
+    }
+    return c;
+}
+
 // --- depth ------------------------------------------------------------------
 // The projection is b1[12..15], rows (captured 2026-10-15): [13].y the
 // vertical focal scale (1/tan(fov/2)), [14].zw the depth terms. It is a plain

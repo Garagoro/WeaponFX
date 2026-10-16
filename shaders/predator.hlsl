@@ -33,9 +33,9 @@ float4 main(PSIn i) : SV_Target {
 
     // A slight prism split: real refraction through a thin moving film.
     float3 seen;
-    seen.r = SceneAt(i, off * 1.08).r;
-    seen.g = SceneAt(i, off).g;
-    seen.b = SceneAt(i, off * 0.92).b;
+    seen.r = SceneAtSafe(i, off * 1.08).r;
+    seen.g = SceneAtSafe(i, off).g;
+    seen.b = SceneAtSafe(i, off * 0.92).b;
 
     // Outline: the grazing edge, its colour turning with the viewing angle and
     // drifting in time. Thin - most of a gun seen nearly edge-on is "edge".

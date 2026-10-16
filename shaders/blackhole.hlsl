@@ -34,7 +34,7 @@ float4 main(PSIn i) : SV_Target {
     // world is folded in, flipped.
     float src = r - re * re / r;
     float2 off = dir * (src - r);
-    float3 seen = SceneAt(i, off);
+    float3 seen = SceneAtSafe(i, off);
 
     // The weapon itself: just a glass edge, so it still reads as a weapon.
     float fr = Fresnel(i, 5.0);

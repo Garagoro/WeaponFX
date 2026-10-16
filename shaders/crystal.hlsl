@@ -72,7 +72,7 @@ float4 main(PSIn i) : SV_Target {
         float s = k / 4.0;                       // 0 red .. 1 violet
         float3 band = saturate(float3(1.5 - abs(s - 0.0) * 3.0, 1.5 - abs(s - 0.45) * 3.0,
                                       1.5 - abs(s - 1.0) * 3.0));
-        seen += SceneAt(i, off * (1.0 + disp * (0.5 - s) * 2.0)) * band;
+        seen += SceneAtSafe(i, off * (1.0 + disp * (0.5 - s) * 2.0)) * band;
         w += band;
     }
     seen /= max(w, 1e-3);
