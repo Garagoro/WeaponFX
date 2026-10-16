@@ -77,7 +77,9 @@ bool BeforeDraw(ID3D11DeviceContext* c, bool weapon);
 // the world's depth has to be copied here - at the run's start it is already
 // the far plane. A stencil-only clear of the main depth comes right before the
 // viewmodel (see the shadow start in weapon_fx.cpp).
-void BeforeClearDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, unsigned flags);
+// `stencil`: the value the clear writes, kept for the viewmodel depth (it is
+// cleared to it instead of copied).
+void BeforeClearDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, unsigned flags, uint8_t stencil);
 // Load an image (PNG/JPG/BMP..., via WIC) into g_fxTex<index>, linear RGBA8,
 // one mip. nullptr or "" clears it. Control thread.
 bool LoadTexture(int index, const char* path);
@@ -90,7 +92,9 @@ using IssueFn = void (*)(void* ctx);
 // Issues a draw BeforeDraw let through: with our shader when it is the
 // weapon's (Begin/End around it), and inside the viewmodel run against our
 // viewmodel depth (SetViewmodelDepth). True when our shader drew it.
-bool Draw(ID3D11DeviceContext* c, bool weapon, IssueFn issue, void* ctx);
+// `key`: the draw's own arguments mixed into one number by the host (0 = none),
+// only to tell an exact repeat of the previous weapon draw in the GPU cost line.
+bool Draw(ID3D11DeviceContext* c, bool weapon, IssueFn issue, void* ctx, uint64_t key = 0);
 // Viewmodel depth (on by default). The see-through setup takes the weapon out
 // of the engine's depth passes and draws it without a depth test, so it lands
 // on top of the fingers and of its own far side. With this on, every draw of

@@ -6,6 +6,7 @@
 #include <Windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <intrin.h>
 #include <atomic>
 #include <cstring>
 
@@ -72,9 +73,29 @@ uintptr_t g_Refused[kRefusedMax] = {};
 int g_RefusedCount = 0;
 
 std::atomic<int> g_InDetour{0};
+// CPU cost watch: the time spent in our draw hooks minus the time inside the
+// game's original calls is what WeaponFX adds on the CPU per draw - at a few
+// hundred draws a frame and a CPU-bound game that is FPS. Logged every 5 s
+// from the present hook, with the per-frame driver's own time. The draws are
+// issued on the render thread only (no deferred contexts in the frame), so
+// plain counters.
+int64_t g_HookTicks = 0, g_OrigTicks = 0, g_FrameFnTicks = 0;
+uint32_t g_CostFrames = 0, g_CostDraws = 0;
+ULONGLONG g_CostNext = 0;
+
+inline int64_t Qpc() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+
 struct Guard {
-    Guard() { g_InDetour.fetch_add(1, std::memory_order_acquire); }
-    ~Guard() { g_InDetour.fetch_sub(1, std::memory_order_release); }
+    int64_t t0;
+    Guard() : t0(Qpc()) { g_InDetour.fetch_add(1, std::memory_order_acquire); ++g_CostDraws; }
+    ~Guard() { g_HookTicks += Qpc() - t0; g_InDetour.fetch_sub(1, std::memory_order_release); }
+};
+
+// Around the game's own call inside a hook.
+struct OrigTime {
+    int64_t t0;
+    OrigTime() : t0(Qpc()) {}
+    ~OrigTime() { g_OrigTicks += Qpc() - t0; }
 };
 
 std::atomic<ID3D11ShaderResourceView*> g_MarkerA{nullptr}, g_MarkerB{nullptr};
@@ -109,18 +130,39 @@ void NotePair(ID3D11DeviceContext* c, unsigned mask, UINT indexCount) {
     Log("d3d: marked draw - PS %p, marker in slots %#x, %u indices", (void*)ps, mask, indexCount);
 }
 
+// The slots the marker has been seen in (union of every marked draw's mask),
+// for the per-draw check: reading all 16 views and releasing them is 32
+// reference counts on every one of ~400 draws a frame - most of what the
+// hooks cost on the CPU (2026-10-16). Most draws read only the learnt span;
+// every kFullScanEvery-th draw reads all 16, so a game update that moves the
+// marker to other slots is relearnt within a frame or two instead of losing
+// the weapon. Reset when the marker views change. Render thread only.
+constexpr unsigned kFullScanEvery = 256;
+unsigned g_MarkerSpan = 0;
+ID3D11ShaderResourceView* g_SpanFor = nullptr;   // the marker the span was learnt for, compared only
+unsigned g_ScanTick = 0;
+
 bool MarkerBound(ID3D11DeviceContext* c, UINT indexCount) {
     ID3D11ShaderResourceView* a = g_MarkerA.load(std::memory_order_relaxed);
     ID3D11ShaderResourceView* b = g_MarkerB.load(std::memory_order_relaxed);
     if (!a && !b) return false;
+    if (g_SpanFor != (a ? a : b)) { g_SpanFor = a ? a : b; g_MarkerSpan = 0; }
+    UINT lo = 0, cnt = 16;
+    if (g_MarkerSpan && ++g_ScanTick % kFullScanEvery) {
+        unsigned long first = 0, last = 0;
+        _BitScanForward(&first, g_MarkerSpan);
+        _BitScanReverse(&last, g_MarkerSpan);
+        lo = first;
+        cnt = last - first + 1;
+    }
     ID3D11ShaderResourceView* srv[16] = {};
-    c->PSGetShaderResources(0, 16, srv);
+    c->PSGetShaderResources(lo, cnt, srv);
     unsigned mask = 0;
-    for (unsigned k = 0; k < 16; ++k) {
-        if (srv[k] && (srv[k] == a || srv[k] == b)) mask |= 1u << k;
+    for (unsigned k = 0; k < cnt; ++k) {
+        if (srv[k] && (srv[k] == a || srv[k] == b)) mask |= 1u << (lo + k);
         if (srv[k]) srv[k]->Release();
     }
-    if (mask) NotePair(c, mask, indexCount);
+    if (mask) { g_MarkerSpan |= mask; NotePair(c, mask, indexCount); }
     // The marker material binds its texture twice (g_tColor and g_tColor2,
     // host/material.cpp), so the weapon's draws carry it in two slots (13 and
     // 14 on 2026-10 builds). A draw with it in one slot inherited a stale
@@ -143,10 +185,12 @@ void STDMETHODCALLTYPE HkDii(ID3D11DeviceContext* c, UINT n, UINT inst, UINT s, 
     if (weapon) g_Marked.fetch_add(1, std::memory_order_relaxed);
     if (WeaponFx::BeforeDraw(c, weapon)) return;
     auto issue = [&] {
+        OrigTime ot;
         ((void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT))g_Det[kDii][S].orig)(c, n, inst,
                                                                                                          s, b, si);
     };
-    WeaponFx::Draw(c, weapon, &CallIssue<decltype(issue)>, &issue);
+    const uint64_t key = ((uint64_t)n << 40) ^ ((uint64_t)inst << 32) ^ ((uint64_t)(uint32_t)b << 20) ^ ((uint64_t)s << 8) ^ si;
+    WeaponFx::Draw(c, weapon, &CallIssue<decltype(issue)>, &issue, key);
 }
 
 template <int S>
@@ -154,7 +198,7 @@ void STDMETHODCALLTYPE HkDi(ID3D11DeviceContext* c, UINT n, UINT s, INT b) {
     Guard g;
     g_Draws.fetch_add(1, std::memory_order_relaxed);
     if (WeaponFx::BeforeDraw(c, false)) return;
-    auto issue = [&] { ((void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT))g_Det[kDi][S].orig)(c, n, s, b); };
+    auto issue = [&] { OrigTime ot; ((void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, INT))g_Det[kDi][S].orig)(c, n, s, b); };
     WeaponFx::Draw(c, false, &CallIssue<decltype(issue)>, &issue);
 }
 
@@ -163,7 +207,7 @@ void STDMETHODCALLTYPE HkD(ID3D11DeviceContext* c, UINT n, UINT s) {
     Guard g;
     g_Draws.fetch_add(1, std::memory_order_relaxed);
     if (WeaponFx::BeforeDraw(c, false)) return;
-    auto issue = [&] { ((void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT))g_Det[kD][S].orig)(c, n, s); };
+    auto issue = [&] { OrigTime ot; ((void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT))g_Det[kD][S].orig)(c, n, s); };
     WeaponFx::Draw(c, false, &CallIssue<decltype(issue)>, &issue);
 }
 
@@ -173,6 +217,7 @@ void STDMETHODCALLTYPE HkDInst(ID3D11DeviceContext* c, UINT n, UINT inst, UINT s
     g_Draws.fetch_add(1, std::memory_order_relaxed);
     if (WeaponFx::BeforeDraw(c, false)) return;
     auto issue = [&] {
+        OrigTime ot;
         ((void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, UINT, UINT, UINT))g_Det[kDInst][S].orig)(c, n, inst, s, si);
     };
     WeaponFx::Draw(c, false, &CallIssue<decltype(issue)>, &issue);
@@ -183,7 +228,7 @@ void STDMETHODCALLTYPE HkInd(ID3D11DeviceContext* c, ID3D11Buffer* args, UINT of
     Guard g;
     g_Draws.fetch_add(1, std::memory_order_relaxed);
     if (WeaponFx::BeforeDraw(c, false)) return;
-    auto issue = [&] { ((void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT))g_Det[K][S].orig)(c, args, off); };
+    auto issue = [&] { OrigTime ot; ((void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buffer*, UINT))g_Det[K][S].orig)(c, args, off); };
     WeaponFx::Draw(c, false, &CallIssue<decltype(issue)>, &issue);
 }
 
@@ -191,7 +236,7 @@ template <int S>
 void STDMETHODCALLTYPE HkClear(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, UINT flags, FLOAT depth,
                                UINT8 stencil) {
     Guard g;
-    WeaponFx::BeforeClearDepth(c, dsv, flags);
+    WeaponFx::BeforeClearDepth(c, dsv, flags, stencil);
     ((void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilView*, UINT, FLOAT, UINT8))g_Det[kClearDsv][S]
          .orig)(c, dsv, flags, depth, stencil);
 }
@@ -249,9 +294,27 @@ HRESULT STDMETHODCALLTYPE HkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
     ID3D11Device* dev = nullptr;
     // The device is asked for every frame: a device reset hands the swap
     // chain a new one, and a cached pointer would be a dead object.
+    const int64_t f0 = Qpc();
     if (SUCCEEDED(sc->GetDevice(__uuidof(ID3D11Device), (void**)&dev)) && dev) {
         if (g_OnFrame) g_OnFrame(sc, dev);
         dev->Release();
+    }
+    g_FrameFnTicks += Qpc() - f0;
+    ++g_CostFrames;
+    const ULONGLONG now = GetTickCount64();
+    if (now >= g_CostNext) {
+        if (g_CostNext && g_CostFrames) {
+            LARGE_INTEGER fq;
+            QueryPerformanceFrequency(&fq);
+            const double ms = 1000.0 / (double)fq.QuadPart / g_CostFrames;
+            Log("d3d: CPU cost - draw hooks %.3f ms/frame over %.0f draws/frame (the game's own calls %.3f ms), "
+                "per-frame driver %.3f ms/frame, %u frames",
+                (double)(g_HookTicks - g_OrigTicks) * ms, (double)g_CostDraws / g_CostFrames, (double)g_OrigTicks * ms,
+                (double)g_FrameFnTicks * ms, g_CostFrames);
+        }
+        g_CostNext = now + 5000;
+        g_HookTicks = g_OrigTicks = g_FrameFnTicks = 0;
+        g_CostFrames = g_CostDraws = 0;
     }
     const HRESULT hr = g_OrigPresent(sc, sync, flags);
     g_InPresent.fetch_sub(1, std::memory_order_release);
