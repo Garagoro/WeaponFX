@@ -177,3 +177,8 @@ named constants at the top of `host/engine.cpp`, `host/material.cpp` and
   effect.
 - The menu belongs to the device it was created on; after a device reset
   (changing the display mode) reload the DLL.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Dear ImGui under `third_party/imgui` is MIT as well,
+with its own notice in `third_party/imgui/LICENSE.txt`.
