@@ -21,8 +21,7 @@ players, spectators and demos see the normal skin.
 | ![Galaxy](media/galaxy.webp) **Galaxy.** A window into space, with near stars drifting past as you turn. | ![Chrome](media/chrome.webp) **Chrome.** The map's reflections on polished metal. |
 | ![Plasma](media/plasma.gif) **Plasma.** Molten energy flowing along the weapon. | ![Hologram](media/hologram.gif) **Hologram.** Rim light, scanlines and glitch flicker. |
 | ![Lava](media/lava.gif) **Lava.** Molten lava churning inside a clear glass shell. | ![Masked](media/masked.png) **Masked.** Two effects on one weapon, split by a mask you paint on its texture. |
-| ![Black hole](media/blackhole.webp) **Black hole.** The world bends around a point of nothing inside the weapon, with a glowing accretion disk. | ![Crystal](media/crystal.webp) **Crystal.** A cut gem: every facet shows its own piece of the world, split into colours. |
-| ![Predator](media/predator.webp) **Predator.** Active camouflage: almost invisible, given away by a shimmering edge. | |
+| ![Black hole](media/blackhole.webp) **Black hole.** The world bends around a point of nothing inside the weapon, with a glowing accretion disk. | |
 
 Your fingers hide the weapon and the weapon hides your fingers, as in the
 real game:
