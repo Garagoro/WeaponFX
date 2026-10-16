@@ -20,7 +20,7 @@ players, spectators and demos see the normal skin.
 | ![See-through](media/seethrough.gif) **See-through.** The weapon is clear and bends the world behind it like a lens. | ![Glass](media/glass.png) **Glass.** Refraction with a prism fringe and a thin reflection at grazing angles. |
 | ![Galaxy](media/galaxy.webp) **Galaxy.** A window into space, with near stars drifting past as you turn. | ![Chrome](media/chrome.webp) **Chrome.** The map's reflections on polished metal. |
 | ![Plasma](media/plasma.gif) **Plasma.** Molten energy flowing along the weapon. | ![Hologram](media/hologram.gif) **Hologram.** Rim light, scanlines and glitch flicker. |
-| ![Lava](media/lava.gif) **Lava.** Molten lava churning inside a clear glass shell. | ![Masked](media/masked.png) **Masked.** Two effects on one weapon, split by a mask you paint on its texture. |
+| ![Lava](media/lava.gif) **Lava.** Molten lava churning inside a clear glass shell. | ![Masked](media/masked.webp) **Masked.** Two effects on one weapon, split by a mask you paint on its texture; `masks/awp_stock.png` is a ready one for the AWP (galaxy stock, chrome metal). |
 | ![Black hole](media/blackhole.webp) **Black hole.** The world bends around a point of nothing inside the weapon, with a glowing accretion disk. | |
 
 Your fingers hide the weapon and the weapon hides your fingers, as in the
