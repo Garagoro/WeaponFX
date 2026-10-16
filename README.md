@@ -2,8 +2,6 @@
 
 **Write your own pixel shaders for the weapon in your hands in Counter-Strike 2.**
 
-![A glass knife bending the world behind it](media/hero.gif)
-
 CS2 skins can only use the shaders Valve ships. WeaponFX lets you draw the
 weapon you are holding with any HLSL pixel shader you write: glass that bends
 the world behind it, a window into space, liquid metal, holograms, lava inside
@@ -17,21 +15,15 @@ players, spectators and demos see the normal skin.
 
 | | |
 |---|---|
-| ![See-through](media/seethrough.gif) **See-through.** The weapon is clear and bends the world behind it like a lens. | ![Glass](media/glass.png) **Glass.** Refraction with a prism fringe and a thin reflection at grazing angles. |
 | ![Galaxy](media/galaxy.webp) **Galaxy.** A window into space, with near stars drifting past as you turn. | ![Chrome](media/chrome.webp) **Chrome.** The map's reflections on polished metal. |
-| ![Plasma](media/plasma.webp) **Plasma.** Molten energy flowing along the weapon. | ![Hologram](media/hologram.gif) **Hologram.** Rim light, scanlines and glitch flicker. |
-| ![Lava](media/lava.gif) **Lava.** Molten lava churning inside a clear glass shell. | ![Masked](media/masked.webp) **Masked.** Two effects on one weapon, split by a mask you paint on its texture; `masks/awp_stock.png` is a ready one for the AWP (galaxy stock, chrome metal). |
+| ![Plasma](media/plasma.webp) **Plasma.** Molten energy flowing along the weapon. | ![Masked](media/masked.webp) **Masked.** Two effects on one weapon, split by a mask you paint on its texture; `masks/awp_stock.png` is a ready one for the AWP (galaxy stock, chrome metal). |
 | ![Black hole](media/blackhole.webp) **Black hole.** The world bends around a point of nothing inside the weapon, with a glowing accretion disk. | |
 
 Your fingers hide the weapon and the weapon hides your fingers, as in the
-real game:
-
-![Fingers in front of a see-through knife](media/fingers.png)
+real game.
 
 Any effect can also go over the skin instead of replacing it, so a mask can cut
-a window into the skin and leave the rest as it is:
-
-![A see-through window cut into a skin](media/overlay.png)
+a window into the skin and leave the rest as it is.
 
 ## Quick start
 
