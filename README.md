@@ -43,9 +43,6 @@ Install, menu, config, writing your own effect, building.
 
 <br>
 
-> WeaponFX is foreign code inside the game process, made for people who write
-> shaders and know how to load a DLL. Use it offline.
-
 > **Maintenance mode.** WeaponFX gets fixes for game updates and little else.
 > It is meant to be forked or built into your own tools: take it and make it
 > yours.
