@@ -16,8 +16,11 @@ what it looks like, see the [README](README.md).
 
 ## Quick start
 
-1. **Build** `WeaponFX.dll` (see [Building](#building)).
-2. **Copy the `shaders` folder** to `%LOCALAPPDATA%\WeaponFX\`.
+1. **Get** `WeaponFX.dll`: download the zip from
+   [Releases](https://github.com/Garagoro/WeaponFX/releases), or build it
+   yourself (see [Building](#building)).
+2. **Copy the `shaders` and `masks` folders** to `%LOCALAPPDATA%\WeaponFX\`
+   (in the release zip they are already in a `WeaponFX` folder).
 3. **Start CS2 offline**: with `-insecure`, on a local server or on a workshop
    map.
 4. **Load `WeaponFX.dll` into `cs2.exe`** with any DLL loader. Loading at the
