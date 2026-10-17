@@ -2,7 +2,7 @@
 
 # WeaponFX
 
-**Your own pixel shaders on the weapon in your hands in Counter-Strike 2.**
+**Your own pixel shaders on the weapon and gloves in your hands in Counter-Strike 2.**
 
 Glass that bends the world behind it · a window into space · liquid metal ·
 holograms · lava under a glass shell
@@ -27,7 +27,7 @@ holograms · lava under a glass shell
 
 **Write HLSL, save, see it in game** — every save recompiles live
 
-**Only your weapon, only your screen** — others and demos see the normal skin
+**Weapon and gloves, only on your screen** — others and demos see the normal skin
 
 **Replace the skin or draw over it** — with masks, textures and parameters
 

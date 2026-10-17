@@ -11,6 +11,7 @@ namespace {
 char g_Dir[kPathBytes] = {};
 SRWLOCK g_DirLock = SRWLOCK_INIT;
 SRWLOCK g_LogLock = SRWLOCK_INIT;
+LogSink g_Sink = nullptr;
 
 // Any address inside this image will do; GetModuleHandleEx with FROM_ADDRESS
 // finds the module only when the loader mapped it.
@@ -96,8 +97,29 @@ void DataPath(const char* name, char* out, unsigned cap) {
     else _snprintf_s(out, cap, _TRUNCATE, "%s%s", DataDir(), name);
 }
 
+void SetDataDir(const char* dir) {
+    wchar_t w[MAX_PATH] = {};
+    if (!dir || !Widen(dir, w, MAX_PATH - 2) || !w[0]) return;
+    CreateDirectoryW(w, nullptr);
+    const size_t len = wcslen(w);
+    if (w[len - 1] != L'\\' && w[len - 1] != L'/') wcscat_s(w, L"\\");
+    AcquireSRWLockExclusive(&g_DirLock);
+    if (!Narrow(w, g_Dir, sizeof(g_Dir))) g_Dir[0] = 0;
+    ReleaseSRWLockExclusive(&g_DirLock);
+}
+
+void SetLogSink(LogSink sink) { g_Sink = sink; }
+
 void Log(const char* fmt, ...) {
     char line[1024];
+    if (const LogSink sink = g_Sink) {
+        va_list ap;
+        va_start(ap, fmt);
+        _vsnprintf_s(line, sizeof(line), _TRUNCATE, fmt, ap);
+        va_end(ap);
+        sink(line);
+        return;
+    }
     SYSTEMTIME t;
     GetLocalTime(&t);
     int o = _snprintf_s(line, sizeof(line), _TRUNCATE, "%02u:%02u:%02u.%03u ", t.wHour, t.wMinute, t.wSecond,

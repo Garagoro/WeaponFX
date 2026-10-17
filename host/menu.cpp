@@ -3,6 +3,7 @@
 #include "d3d_hooks.h"
 #include "engine.h"
 #include "log.h"
+#include "panel.h"
 #include "patch.h"
 
 #include "../third_party/imgui/imgui.h"
@@ -231,150 +232,14 @@ LRESULT CALLBACK HkWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // --- the window -----------------------------------------------------------------
 
-constexpr int kMaxShaders = 64;
-char g_Shaders[kMaxShaders][Config::kPath] = {};
-int g_ShaderCount = 0;
-char g_ShaderDir[Config::kPath] = {};
-
-char g_Section[Config::kPath] = {};
-unsigned g_Gen = ~0u;
-Config::Settings g_Edit;
-bool g_Dirty = false;
-char g_Note[160] = {};
-
-// The .hlsl files next to the current shader (or in shaders\), for the list.
-void ScanShaders() {
-    char dir[Config::kPath] = {};
-    char cur[Config::kPath];
-    DataPath(g_Edit.shader[0] ? g_Edit.shader : "shaders\\x", cur, sizeof(cur));
-    strncpy_s(dir, cur, _TRUNCATE);
-    char* cut = nullptr;
-    for (char* p = dir; *p; ++p)
-        if (*p == '\\' || *p == '/') cut = p;
-    if (cut) cut[1] = 0;
-    strncpy_s(g_ShaderDir, dir, _TRUNCATE);
-    g_ShaderCount = 0;
-    char pattern[Config::kPath];
-    _snprintf_s(pattern, sizeof(pattern), _TRUNCATE, "%s*.hlsl", dir);
-    wchar_t wpattern[MAX_PATH];
-    if (!Widen(pattern, wpattern, MAX_PATH)) return;
-    WIN32_FIND_DATAW f;
-    HANDLE h = FindFirstFileW(wpattern, &f);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        char name[Config::kPath];
-        if (f.cFileName[0] == L'_' || !Narrow(f.cFileName, name, sizeof(name))) continue;   // '_': probes, not effects
-        _snprintf_s(g_Shaders[g_ShaderCount], Config::kPath, _TRUNCATE, "%s%s", dir, name);
-        ++g_ShaderCount;
-    } while (g_ShaderCount < kMaxShaders && FindNextFileW(h, &f));
-    FindClose(h);
-}
-
-const char* FileName(const char* path) {
-    const char* n = path;
-    for (const char* p = path; *p; ++p)
-        if (*p == '\\' || *p == '/') n = p + 1;
-    return n;
-}
-
-void Sync() {
-    char section[Config::kPath];
-    Config::CurrentSection(section, sizeof(section));
-    if (!section[0]) strcpy_s(section, "default");
-    const unsigned gen = Config::Generation();
-    if (gen == g_Gen && strcmp(section, g_Section) == 0) return;
-    g_Gen = gen;
-    strcpy_s(g_Section, section);
-    Config::Read(g_Section, &g_Edit);
-    g_Dirty = false;
-    ScanShaders();
-}
-
 void Window() {
-    Sync();
-    bool changed = false;
-    ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(560, 0), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(60, 60), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("WeaponFX", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::End();
         return;
     }
-    ImGui::Text("Weapon in hands: [%s]%s", g_Section, g_Dirty ? "  (not saved)" : "");
-    ImGui::Separator();
-
-    int mode = (int)g_Edit.mode;
-    const char* modes[] = { "off", "replace", "overlay" };
-    if (ImGui::Combo("Mode", &mode, modes, 3)) {
-        g_Edit.mode = (Engine::Mode)mode;
-        changed = true;
-    }
-    if (ImGui::BeginCombo("Shader", g_Edit.shader[0] ? FileName(g_Edit.shader) : "(none)")) {
-        for (int i = 0; i < g_ShaderCount; ++i) {
-            const bool sel = _stricmp(g_Shaders[i], g_Edit.shader) == 0;
-            if (ImGui::Selectable(FileName(g_Shaders[i]), sel)) {
-                strcpy_s(g_Edit.shader, g_Shaders[i]);
-                changed = true;
-            }
-        }
-        if (!g_ShaderCount) ImGui::TextDisabled("no .hlsl in %s", g_ShaderDir);
-        ImGui::EndCombo();
-    }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Rescan")) ScanShaders();
-    if (ImGui::InputText("Shader file", g_Edit.shader, sizeof(g_Edit.shader), ImGuiInputTextFlags_EnterReturnsTrue))
-        changed = true;
-
-    ImGui::Separator();
-    for (int i = 0; i < Config::kSlots; ++i) {
-        ImGui::PushID(i);
-        char label[32];
-        _snprintf_s(label, sizeof(label), _TRUNCATE, "tex%d", i);
-        if (ImGui::InputText(label, g_Edit.tex[i], sizeof(g_Edit.tex[i]), ImGuiInputTextFlags_EnterReturnsTrue)) changed = true;
-        ImGui::SameLine();
-        if (ImGui::SmallButton("x") && g_Edit.tex[i][0]) {
-            g_Edit.tex[i][0] = 0;
-            changed = true;
-        }
-        ImGui::PopID();
-    }
-    for (int i = 0; i < Config::kSlots; ++i) {
-        char label[32];
-        _snprintf_s(label, sizeof(label), _TRUNCATE, "param%d", i);
-        if (ImGui::DragFloat4(label, g_Edit.param[i], 0.01f)) changed = true;
-    }
-    if (ImGui::Checkbox("Viewmodel depth", &g_Edit.vmdepth)) changed = true;
-
-    if (changed) {
-        g_Dirty = true;
-        Config::Preview(g_Section, g_Edit);
-    }
-
-    ImGui::Separator();
-    char buf[96];
-    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "Save to [%s]", g_Section);
-    if (ImGui::Button(buf)) {
-        const bool ok = Config::Write(g_Section, g_Edit);
-        _snprintf_s(g_Note, sizeof(g_Note), _TRUNCATE, ok ? "saved to [%s]" : "saving [%s] failed - see weaponfx.log", g_Section);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Save to [default]")) {
-        const bool ok = Config::Write("default", g_Edit);
-        _snprintf_s(g_Note, sizeof(g_Note), _TRUNCATE, ok ? "saved to [default]" : "saving [default] failed - see weaponfx.log");
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Revert")) {
-        g_Gen = ~0u;   // read the file again
-        Config::Invalidate();
-        g_Note[0] = 0;
-    }
-    if (g_Note[0]) ImGui::TextDisabled("%s", g_Note);
-
-    unsigned draws = 0, marked = 0, passes = 0, items = 0, stripped = 0, noRoom = 0;
-    int hooks = 0;
-    D3d::Stats(&draws, &marked, &hooks);
-    Engine::Stats(&passes, &items, &stripped, &noRoom);
-    ImGui::TextDisabled("draw hooks %d, marked draws %u / %u; viewmodel passes %u, weapon items %u, no room %u", hooks,
-                        marked, draws, passes, items, noRoom);
+    Panel::Draw();
     ImGui::TextDisabled("Insert / Esc closes. weaponfx.log in %s", DataDir());
     ImGui::End();
 }

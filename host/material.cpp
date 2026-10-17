@@ -1,6 +1,7 @@
 #include "material.h"
 #include "log.h"
 #include "patch.h"
+#include "../core/weapon_fx.h"
 
 #include <Windows.h>
 #include <atomic>
@@ -11,10 +12,14 @@ namespace Wfx {
 namespace Material {
 namespace {
 
-// The marker: csgo_unlitgeneric with every depth feature off (the weapon has
+using WeaponFx::kTargets;
+
+// The markers: csgo_unlitgeneric with every depth feature off (the weapon has
 // to stay out of the depth passes, or the world behind it is never drawn) and
-// a texture nothing else in a match uses.
-const char kMarkerKv3[] =
+// a texture nothing else in a match uses - one texture per target, because the
+// D3D side tells the weapon's draws from the gloves' by which view is bound.
+// %s is the texture, twice.
+const char kMarkerKv3Fmt[] =
     "<!-- kv3 encoding:text:version{e21c7f3c-8a33-41c5-9977-a76d3a32aa0d} "
     "format:generic:version{7412167c-06e9-4698-aff2-e63eb59037e7} -->\n"
     "{\n"
@@ -24,13 +29,18 @@ const char kMarkerKv3[] =
     "\tF_DISABLE_Z_PREPASS = 1\n"
     "\tF_DISABLE_Z_WRITE = 1\n"
     "\tg_vColorTint = [1.0, 1.0, 1.0, 0.0]\n"
-    "\tg_tColor = resource:\"materials/dev/black_grid_8_color_tga_dd8b6813.vtex\"\n"
-    "\tg_tColor2 = resource:\"materials/dev/black_grid_8_color_tga_dd8b6813.vtex\"\n"
+    "\tg_tColor = resource:\"%s\"\n"
+    "\tg_tColor2 = resource:\"%s\"\n"
     "}\n";
-// The same texture, as the resource system names it. Nothing in a match loads
-// it, so it is asked for before the material is made; without that the
-// material comes out with the engine's error texture.
-constexpr char kMarkerTexture[] = "materials/dev/black_grid_8_color_tga_dd8b6813.vtex";
+// The textures, as the resource system names them. Nothing in a match loads
+// them, so each is asked for before its material is made; without that the
+// material comes out with the engine's error texture. Two dev textures of the
+// base game **[fragile: a map that drew with one would get that target's
+// effect on its surfaces]**.
+const char* const kMarkerTexture[kTargets] = {
+    "materials/dev/black_grid_8_color_tga_dd8b6813.vtex",   // the weapon
+    "materials/dev/gray_grid_8_color_tga_2bcb1c0a.vtex",    // the gloves
+};
 constexpr ULONGLONG kLoadWaitMs = 500;   // the request is not blocking; give it a moment
 constexpr char kMarkerParam[] = "g_tColor";
 
@@ -73,9 +83,9 @@ constexpr uint32_t kMaxParams = 512;
 
 struct Kv3Id { const char* name; uint64_t a, b; };
 
-std::atomic<void*> g_Marker{nullptr};
-bool g_Tried = false;
-ULONGLONG g_CreateAt = 0;   // 0: the texture not requested yet
+std::atomic<void*> g_Marker[kTargets] = {};
+bool g_Tried[kTargets] = {};
+ULONGLONG g_CreateAt[kTargets] = {};   // 0: the texture not requested yet
 
 // IResourceSystem (resourcesystem.dll, by interface name), slot 22: preload a
 // list of resources (ResourceLoadRequest_t).
@@ -100,7 +110,7 @@ bool CallPreload(void* rs, ResPreloadFn fn, const char* path) {
     }
 }
 
-void RequestTexture() {
+void RequestTexture(const char* texture) {
     HMODULE m = GetModuleHandleW(L"resourcesystem.dll");
     const CreateInterfaceFn create = m ? (CreateInterfaceFn)GetProcAddress(m, "CreateInterface") : nullptr;
     void* rs = nullptr;
@@ -115,7 +125,7 @@ void RequestTexture() {
         Log("material: %s not found - the marker may come out with the error texture", kResVersion);
         return;
     }
-    if (!CallPreload(rs, (ResPreloadFn)fn, kMarkerTexture)) Log("material: preload of %s faulted", kMarkerTexture);
+    if (!CallPreload(rs, (ResPreloadFn)fn, texture)) Log("material: preload of %s faulted", texture);
 }
 
 bool ReadPtr(uintptr_t at, void** out) { return ReadMem(at, out, sizeof(*out)); }
@@ -173,23 +183,26 @@ bool Resolve() {
     return true;
 }
 
-void* Marker() {
-    if (void* m = g_Marker.load(std::memory_order_acquire)) return m;
-    if (g_Tried) return nullptr;
-    if (!g_CreateAt) {
-        RequestTexture();
-        g_CreateAt = GetTickCount64() + kLoadWaitMs;
+void* Marker(int target) {
+    if (target < 0 || target >= kTargets) return nullptr;
+    if (void* m = g_Marker[target].load(std::memory_order_acquire)) return m;
+    if (g_Tried[target]) return nullptr;
+    if (!g_CreateAt[target]) {
+        RequestTexture(kMarkerTexture[target]);
+        g_CreateAt[target] = GetTickCount64() + kLoadWaitMs;
         return nullptr;
     }
-    if (GetTickCount64() < g_CreateAt) return nullptr;
-    g_Tried = true;   // one attempt per load: a failure is logged, not retried every frame
+    if (GetTickCount64() < g_CreateAt[target]) return nullptr;
+    g_Tried[target] = true;   // one attempt per load: a failure is logged, not retried every frame
     if (!Resolve()) return nullptr;
-    void* kv = LoadKv3(kMarkerKv3);
+    char text[sizeof(kMarkerKv3Fmt) + 256];
+    _snprintf_s(text, sizeof(text), _TRUNCATE, kMarkerKv3Fmt, kMarkerTexture[target], kMarkerTexture[target]);
+    void* kv = LoadKv3(text);
     if (!kv) return nullptr;
     // A name per load: a second load in the same game session must not get
     // the first one's (possibly purged) resource back.
     char name[96];
-    _snprintf_s(name, sizeof(name), _TRUNCATE, "materials/weaponfx/marker_%llx.vmat",
+    _snprintf_s(name, sizeof(name), _TRUNCATE, "materials/weaponfx/marker%d_%llx.vmat", target,
                 (unsigned long long)GetTickCount64());
     void* binding = nullptr;   // CStrongHandle: one pointer, to the resource binding
     __try {
@@ -201,16 +214,18 @@ void* Marker() {
     void* mat = nullptr;
     if (!binding || !ReadPtr((uintptr_t)binding, &mat) || !mat) { Log("material: CreateMaterial returned nothing"); return nullptr; }
     TakeReference(binding);
-    g_Marker.store(mat, std::memory_order_release);
-    Log("material: marker %s = %p", name, mat);
+    g_Marker[target].store(mat, std::memory_order_release);
+    Log("material: marker %s = %p (%s)", name, mat, kMarkerTexture[target]);
     return mat;
 }
 
-void* MarkerIfReady() { return g_Marker.load(std::memory_order_acquire); }
+void* MarkerIfReady(int target) {
+    return target >= 0 && target < kTargets ? g_Marker[target].load(std::memory_order_acquire) : nullptr;
+}
 
-void MarkerViews(ID3D11ShaderResourceView** a, ID3D11ShaderResourceView** b) {
+void MarkerViews(int target, ID3D11ShaderResourceView** a, ID3D11ShaderResourceView** b) {
     *a = *b = nullptr;
-    void* mat = g_Marker.load(std::memory_order_acquire);
+    void* mat = MarkerIfReady(target);
     if (!mat) return;
     uint32_t count = 0;
     void* block = nullptr;
