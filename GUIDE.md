@@ -3,6 +3,11 @@
 Everything about installing, using and extending WeaponFX. For what it is and
 what it looks like, see the [README](README.md).
 
+WeaponFX is in maintenance mode: it is kept working across game updates, and
+new features are not planned. It is meant to be forked or embedded (see
+[Embedding WeaponFX in another tool](#how-it-works)); issues and feature
+requests are not tracked.
+
 - [Quick start](#quick-start)
 - [Using it](#using-it)
   - [The menu (Insert)](#the-menu-insert)
@@ -16,8 +21,11 @@ what it looks like, see the [README](README.md).
 
 ## Quick start
 
-1. **Build** `WeaponFX.dll` (see [Building](#building)).
-2. **Copy the `shaders` folder** to `%LOCALAPPDATA%\WeaponFX\`.
+1. **Get** `WeaponFX.dll`: download the zip from
+   [Releases](https://github.com/Garagoro/WeaponFX/releases), or build it
+   yourself (see [Building](#building)).
+2. **Copy the `shaders` and `masks` folders** to `%LOCALAPPDATA%\WeaponFX\`
+   (in the release zip they are already in a `WeaponFX` folder).
 3. **Start CS2 offline**: with `-insecure`, on a local server or on a workshop
    map.
 4. **Load `WeaponFX.dll` into `cs2.exe`** with any DLL loader. Loading at the
