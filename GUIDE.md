@@ -3,6 +3,11 @@
 Everything about installing, using and extending WeaponFX. For what it is and
 what it looks like, see the [README](README.md).
 
+WeaponFX is in maintenance mode: it is kept working across game updates, and
+new features are not planned. It is meant to be forked or embedded (see
+[Embedding WeaponFX in another tool](#how-it-works)); issues and feature
+requests are not tracked.
+
 - [Quick start](#quick-start)
 - [Using it](#using-it)
   - [The menu (Insert)](#the-menu-insert)
