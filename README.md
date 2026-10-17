@@ -46,4 +46,6 @@ Install, menu, config, writing your own effect, building.
 > WeaponFX is foreign code inside the game process, made for people who write
 > shaders and know how to load a DLL. Use it offline.
 
+<sub>Like it? <a href="https://pay.cloudtips.ru/p/d7e3ac51">Support the project ♥</a></sub>
+
 <sub>MIT licensed. Dear ImGui under <code>third_party/imgui</code> is MIT as well.</sub>
