@@ -26,8 +26,8 @@ if not exist "%OBJ%" mkdir "%OBJ%"
 REM /PDBALTPATH: the DLL names its PDB by file name only - the full path
 REM would carry the builder's user folder into every DLL handed out.
 REM /W4 /WX: clean or nothing. /Zi: a PDB next to the DLL, for crash dumps.
-set CFLAGS=/nologo /std:c++17 /EHsc /O2 /W4 /WX /utf-8 /Zi /DNDEBUG /DWIN32_LEAN_AND_MEAN /DNOMINMAX
-set SRC="%HERE%core\weapon_fx.cpp" "%HERE%host\log.cpp" "%HERE%host\patch.cpp" "%HERE%host\d3d_hooks.cpp" "%HERE%host\menu.cpp" "%HERE%host\ini.cpp" "%HERE%host\config.cpp" "%HERE%host\material.cpp" "%HERE%host\engine.cpp" "%HERE%host\dllmain.cpp"
+set CFLAGS=/nologo /std:c++17 /EHsc /O2 /W4 /WX /utf-8 /Zi /DNDEBUG /DWIN32_LEAN_AND_MEAN /DNOMINMAX /I"%HERE%third_party\imgui"
+set SRC="%HERE%core\weapon_fx.cpp" "%HERE%host\log.cpp" "%HERE%host\patch.cpp" "%HERE%host\d3d_hooks.cpp" "%HERE%host\menu.cpp" "%HERE%host\panel.cpp" "%HERE%host\ini.cpp" "%HERE%host\config.cpp" "%HERE%host\material.cpp" "%HERE%host\engine.cpp" "%HERE%host\dllmain.cpp"
 
 REM Dear ImGui is third-party code: its own warning level, not /WX.
 set IMGUI=%HERE%third_party\imgui
@@ -38,7 +38,7 @@ cl %CFLAGS% /c %SRC%
 if errorlevel 1 goto :fail
 cl /nologo /std:c++17 /EHsc /O2 /W3 /utf-8 /Zi /DNDEBUG /DWIN32_LEAN_AND_MEAN /DNOMINMAX /c %IMGUI_SRC%
 if errorlevel 1 goto :fail
-link /nologo /DLL /DEBUG /PDBALTPATH:%%_PDB%% /OPT:REF /OPT:ICF /OUT:"%OUT%\WeaponFX.dll" weapon_fx.obj log.obj patch.obj d3d_hooks.obj menu.obj ini.obj config.obj material.obj engine.obj dllmain.obj imgui.obj imgui_draw.obj imgui_tables.obj imgui_widgets.obj imgui_impl_dx11.obj imgui_impl_win32.obj d3d11.lib dxgi.lib dxguid.lib windowscodecs.lib ole32.lib user32.lib d3dcompiler.lib
+link /nologo /DLL /DEBUG /PDBALTPATH:%%_PDB%% /OPT:REF /OPT:ICF /OUT:"%OUT%\WeaponFX.dll" weapon_fx.obj log.obj patch.obj d3d_hooks.obj menu.obj panel.obj ini.obj config.obj material.obj engine.obj dllmain.obj imgui.obj imgui_draw.obj imgui_tables.obj imgui_widgets.obj imgui_impl_dx11.obj imgui_impl_win32.obj d3d11.lib dxgi.lib dxguid.lib windowscodecs.lib ole32.lib user32.lib d3dcompiler.lib
 if errorlevel 1 goto :fail
 popd
 echo === Build OK: %OUT%\WeaponFX.dll ===

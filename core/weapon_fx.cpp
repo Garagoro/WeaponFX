@@ -40,9 +40,10 @@ using D3DReflectFn = HRESULT(WINAPI*)(const void*, SIZE_T, REFIID, void**);
 // Mirrors the cbuffer in shaders/weaponfx.hlsli; the static_assert
 // below and the HLSL packing rules (float4 rows) keep them in step.
 struct FxConstants {
-    float time[4];     // seconds since Load, delta to the previous draw, draw counter, 0
+    float time[4];     // seconds since Load, delta to the previous draw, draw counter, target
     float screen[4];   // viewport width, height, 1/width, 1/height
     float param[kParams][4];
+    float frames[4];   // frame count (0: none), fps, 0, 0 - g_fxFrameInfo
 };
 static_assert(sizeof(FxConstants) % 16 == 0, "constant buffers are float4 rows");
 
@@ -52,17 +53,55 @@ pD3DCompile g_Compile = nullptr;
 D3DReflectFn g_Reflect = nullptr;
 ID3D11Buffer* g_Cb = nullptr;
 
-std::atomic<ID3D11PixelShader*> g_Ps{nullptr};
-// Whether the bound shader samples g_fxScene / g_fxDepth; each copy costs a
-// full-screen blit, so effects that do not look through the weapon do not pay.
-std::atomic<bool> g_PsUsesScene{false};
-std::atomic<bool> g_PsUsesDepth{false};
+// One per target (weapon_fx.h Target): the shader file, its compiled PS, its
+// textures and parameters. Everything else here - the copies, the viewmodel
+// depth, the run tracking - is shared: both targets are drawn in the same
+// viewmodel runs. Constant-initialised, so a manual map needs no CRT init.
+constexpr size_t kPathCap = 1024;   // UTF-8
+struct Program {
+    std::atomic<ID3D11PixelShader*> ps{nullptr};
+    // Whether the shader samples g_fxScene / g_fxDepth; each copy costs a
+    // full-screen blit, so effects that do not look through do not pay.
+    std::atomic<bool> usesScene{false};
+    std::atomic<bool> usesDepth{false};
+    // Mask textures, published for the render thread. Replaced ones are retired.
+    std::atomic<ID3D11ShaderResourceView*> tex[kTextures] = {};
+    std::atomic<float> param[kParams][4] = {};
+    // SetFrames. The count rides with the view's publication: read after it.
+    std::atomic<ID3D11ShaderResourceView*> frames{nullptr};
+    std::atomic<uint32_t> frameCount{0};
+    std::atomic<float> frameFps{0.0f};
+    char path[kPathCap] = {};        // under g_CompileLock
+    FILETIME pathTime = {};
+    LARGE_INTEGER t0 = {};
+    std::atomic<uint32_t> draws{0}, compiles{0}, failures{0};
+};
+Program g_Prog[kTargets];
+const char* const kTargetName[kTargets] = { "weapon", "gloves" };
+
+bool ValidTarget(int t) { return t >= 0 && t < kTargets; }
+// The shared machinery runs while any target has a shader; a copy is made
+// when any of them reads it.
+bool AnyActive() {
+    for (const Program& p : g_Prog)
+        if (p.ps.load(std::memory_order_relaxed)) return true;
+    return false;
+}
+bool AnyScene() {
+    for (const Program& p : g_Prog)
+        if (p.ps.load(std::memory_order_relaxed) && p.usesScene.load(std::memory_order_relaxed)) return true;
+    return false;
+}
+bool AnyDepth() {
+    for (const Program& p : g_Prog)
+        if (p.ps.load(std::memory_order_relaxed) && p.usesDepth.load(std::memory_order_relaxed)) return true;
+    return false;
+}
+// Per draw: whether this target's own shader looks through (its depth pass).
+bool ReadsScene(int t) { return ValidTarget(t) && g_Prog[t].usesScene.load(std::memory_order_relaxed); }
 // out = src + dst * (1 - src.a): premultiplied over, so a shader's alpha is how
 // much of what is under the weapon's pixel it covers.
 ID3D11BlendState* g_Blend = nullptr;
-
-// Mask textures, published for the render thread. Replaced ones are retired.
-std::atomic<ID3D11ShaderResourceView*> g_Tex[kTextures] = {};
 
 // The scene behind the weapon and its depth, copied together. Render thread only.
 //
@@ -307,16 +346,40 @@ uint32_t g_MainDepthClears = 0;    // depth clears of the main depth so far (ren
 uint8_t g_StencilClearValue = 0;
 uint32_t g_StencilClearGen = ~0u;
 std::atomic<uint32_t> g_VmDepthCleared{0}, g_VmDepthCopiedAll{0}, g_VmDepthEarlyAll{0};
+// Why a viewmodel depth was copied rather than cleared: no stencil event this
+// frame, or a depth clear of the main depth came between it and the run.
+std::atomic<uint32_t> g_CopyNoEvent{0}, g_CopyClearBetween{0};
+uint32_t g_ClearsLogged = 0;   // one-shot trace of what came between (render thread)
+// The last depth clear of the main depth: its flags and stencil value, and the
+// draws since that may have written its stencil. Render thread.
+unsigned g_LastMainClearFlags = 0;
+uint8_t g_LastMainClearStencil = 0;
+uint32_t g_StencilWritesSinceClear = 0;
+// The main depth's whole stencil is one known value: a clear with
+// D3D11_CLEAR_STENCIL set it and no draw has written stencil since. Then our
+// viewmodel depth is a clear to (far, that value) - exactly what the copy
+// would give, since the copy's depth is cleared after it anyway. The game
+// (2026-10-17) clears depth and stencil to 0 after its stencil-only clear and
+// draws the world's depth with no stencil writes, so the old rule - "no depth
+// clear after the stencil event" - never held and every frame copied
+// 2560x1440 D24S8: -100 fps with a screen capture sharing the GPU.
+bool g_MainStencilKnown = false;
+uint8_t g_MainStencilValue = 0;
+uint8_t g_VmClearedStencil = 0;   // the stencil our early clear wrote
 uint32_t g_VmDepthClearGen = ~0u;  // g_MainDepthClears at the last preparation
 std::atomic<uint32_t> g_VmDepthKeptAcrossRun{0};
 bool g_VmDepthReady = false;       // prepared for g_VmDepthFrame
 ID3D11DepthStencilState* g_DsPre = nullptr;   // depth-only pass: LESS_EQUAL, write, no stencil
 ID3D11DepthStencilState* g_DsFx = nullptr;    // our colour pass: LESS_EQUAL, no write, no stencil
 std::atomic<uint32_t> g_VmDepthDraws{0}, g_VmDepthPre{0}, g_VmDepthFails{0};
+std::atomic<unsigned> g_DebugBits{0};
+// What the viewmodel draws that got our depth-only pass were: depth test off,
+// or on with this comparison (index = D3D11_COMPARISON_FUNC, 1..8).
+std::atomic<uint32_t> g_PreNoTest{0}, g_PreFunc[9] = {};
+uint32_t g_VmTraceFrame = ~0u;   // the frame kDbgTraceVm logs (render thread)
+int g_VmTraceLines = 0;
 
 SRWLOCK g_CompileLock = SRWLOCK_INIT;   // Load and the watcher both compile
-char g_Path[1024] = {};   // UTF-8
-FILETIME g_PathTime = {};
 
 struct Grave { IUnknown* obj; ULONGLONG at; };
 Grave g_Grave[kGraveSlots] = {};
@@ -325,11 +388,8 @@ SRWLOCK g_GraveLock = SRWLOCK_INIT;   // the watcher, Load and the render thread
 HANDLE g_Stop = nullptr;
 HANDLE g_Watcher = nullptr;
 
-std::atomic<float> g_Param[kParams][4] = {};
-LARGE_INTEGER g_T0 = {}, g_Freq = {};
+LARGE_INTEGER g_Freq = {};
 std::atomic<int64_t> g_LastTick{0};
-std::atomic<uint32_t> g_Draws{0};
-std::atomic<uint32_t> g_Compiles{0}, g_Failures{0};
 
 void Logf(const char* fmt, ...) {
     if (!g_Log) return;
@@ -444,7 +504,7 @@ public:
         *data = nullptr;
         *bytes = 0;
         if (!name || !*name) return E_FAIL;
-        char path[sizeof(g_Path)];
+        char path[kPathCap];
         const bool absolute = (name[0] && name[1] == ':') || (name[0] == '\\' && name[1] == '\\');
         _snprintf_s(path, sizeof(path), _TRUNCATE, "%s%s", absolute ? "" : m_Dir, name);
         char* src = nullptr;
@@ -461,31 +521,39 @@ public:
     }
 
 private:
-    char m_Dir[sizeof(g_Path)];
+    char m_Dir[kPathCap];
 };
+
+// The compiler's last word per target, for a host that shows it (the editor's
+// status reply): the log alone made a typo look like "the effect does nothing".
+// Under g_CompileLock.
+char g_Error[kTargets][1024] = {};
 
 // Caller holds g_CompileLock exclusively. A failed compile leaves the current
 // shader in place: a typo mid-edit must not blank the weapon.
-bool CompileLocked() {
+bool CompileLocked(int t) {
+    Program& p = g_Prog[t];
     char* src = nullptr;
     DWORD len = 0;
     FILETIME when = {};
-    if (!ReadSource(g_Path, &src, &len, &when)) {
-        Logf("WeaponFX: cannot read %s", g_Path);
+    if (!ReadSource(p.path, &src, &len, &when)) {
+        Logf("WeaponFX: %s - cannot read %s", kTargetName[t], p.path);
+        _snprintf_s(g_Error[t], sizeof(g_Error[t]), _TRUNCATE, "cannot read %s", p.path);
         return false;
     }
-    g_PathTime = when;   // a broken save is not retried until the next save
+    p.pathTime = when;   // a broken save is not retried until the next save
 
     ID3DBlob* code = nullptr;
     ID3DBlob* err = nullptr;
-    FolderInclude includes(g_Path);
-    const HRESULT hr = g_Compile(src, len, g_Path, nullptr, &includes, "main", "ps_5_0",
+    FolderInclude includes(p.path);
+    const HRESULT hr = g_Compile(src, len, p.path, nullptr, &includes, "main", "ps_5_0",
                                  D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
     HeapFree(GetProcessHeap(), 0, src);
     if (FAILED(hr) || !code) {
-        g_Failures.fetch_add(1, std::memory_order_relaxed);
-        Logf("WeaponFX: %s did not compile, keeping the previous shader:\n%s", g_Path,
-             err ? (const char*)err->GetBufferPointer() : "(no message)");
+        p.failures.fetch_add(1, std::memory_order_relaxed);
+        const char* msg = err ? (const char*)err->GetBufferPointer() : "(no message)";
+        Logf("WeaponFX: %s - %s did not compile, keeping the previous shader:\n%s", kTargetName[t], p.path, msg);
+        strncpy_s(g_Error[t], msg, _TRUNCATE);
         if (err) err->Release();
         if (code) code->Release();
         return false;
@@ -497,17 +565,19 @@ bool CompileLocked() {
     const bool usesDepth = ShaderReads(code->GetBufferPointer(), code->GetBufferSize(), "g_fxDepth");
     code->Release();
     if (FAILED(hc) || !ps) {
-        g_Failures.fetch_add(1, std::memory_order_relaxed);
-        Logf("WeaponFX: CreatePixelShader failed (0x%08X)", (unsigned)hc);
+        p.failures.fetch_add(1, std::memory_order_relaxed);
+        Logf("WeaponFX: %s - CreatePixelShader failed (0x%08X)", kTargetName[t], (unsigned)hc);
+        _snprintf_s(g_Error[t], sizeof(g_Error[t]), _TRUNCATE, "CreatePixelShader failed (0x%08X)", (unsigned)hc);
         return false;
     }
     // The flag before the shader: a draw that sees the new shader must not see
     // the old "no scene" and skip the copy it reads.
-    g_PsUsesScene.store(usesScene, std::memory_order_release);
-    g_PsUsesDepth.store(usesDepth, std::memory_order_release);
-    Retire(g_Ps.exchange(ps, std::memory_order_acq_rel));
-    g_Compiles.fetch_add(1, std::memory_order_relaxed);
-    Logf("WeaponFX: %s compiled%s%s", g_Path, usesScene ? " (reads the scene)" : "",
+    p.usesScene.store(usesScene, std::memory_order_release);
+    p.usesDepth.store(usesDepth, std::memory_order_release);
+    Retire(p.ps.exchange(ps, std::memory_order_acq_rel));
+    p.compiles.fetch_add(1, std::memory_order_relaxed);
+    g_Error[t][0] = 0;
+    Logf("WeaponFX: %s - %s compiled%s%s", kTargetName[t], p.path, usesScene ? " (reads the scene)" : "",
          usesDepth ? " (reads depth)" : "");
     return true;
 }
@@ -527,12 +597,18 @@ std::atomic<bool> g_MemTripped{false};
 // Under g_CompileLock. Watches the whole process, not just our objects: a leak
 // anywhere while the effect runs is reason enough to stop it, and it is the
 // one guard that also covers a churn path nobody has thought of yet.
+// Both targets go off together: the leak it guards against is in the shared
+// copies, not in one shader.
 void MemGuardLocked() {
-    if (!g_Path[0] || !g_MemBase) return;
+    bool loaded = false;
+    for (const Program& p : g_Prog) loaded = loaded || p.path[0];
+    if (!loaded || !g_MemBase) return;
     const ULONGLONG now = PrivateBytes();
     if (!now || now <= g_MemBase + kMaxGrowthBytes) return;
-    g_Path[0] = 0;
-    Retire(g_Ps.exchange(nullptr, std::memory_order_acq_rel));
+    for (Program& p : g_Prog) {
+        p.path[0] = 0;
+        Retire(p.ps.exchange(nullptr, std::memory_order_acq_rel));
+    }
     g_CopiesTripped.store(true, std::memory_order_relaxed);
     g_MemTripped.store(true, std::memory_order_relaxed);
     Logf("WeaponFX: OFF by the memory guard - game private memory %.2f GB, %.2f GB when loaded (limit +%.0f GB)",
@@ -544,12 +620,14 @@ DWORD WINAPI WatchThread(void*) {
         AcquireSRWLockExclusive(&g_CompileLock);
         Bury(false);
         MemGuardLocked();
-        if (g_Path[0]) {
+        for (int t = 0; t < kTargets; ++t) {
+            Program& p = g_Prog[t];
+            if (!p.path[0]) continue;
             WIN32_FILE_ATTRIBUTE_DATA a = {};
             wchar_t w[MAX_PATH];
-            if (WidePath(g_Path, w, MAX_PATH) && GetFileAttributesExW(w, GetFileExInfoStandard, &a) &&
-                CompareFileTime(&a.ftLastWriteTime, &g_PathTime) != 0)
-                CompileLocked();
+            if (WidePath(p.path, w, MAX_PATH) && GetFileAttributesExW(w, GetFileExInfoStandard, &a) &&
+                CompareFileTime(&a.ftLastWriteTime, &p.pathTime) != 0)
+                CompileLocked(t);
         }
         ReleaseSRWLockExclusive(&g_CompileLock);
     }
@@ -711,6 +789,7 @@ bool TimerMake(TimerFrame& t) {
 // Around one weapon draw. -1 = not timed (this frame's set full or not read
 // back yet, or the timer is broken).
 int TimerOpen(ID3D11DeviceContext* c, TimerWhat what) {
+    if (g_DebugBits.load(std::memory_order_relaxed) & kDbgNoTimers) return -1;
     if (g_TimerBroken || g_TimerNested || c != g_TrackCtx) return -1;
     TimerFrame& t = g_Timer[g_TimerCur];
     if (t.pending) return -1;
@@ -916,8 +995,35 @@ struct DrawSnap {
     const void* dsv = nullptr;
     const void* vb0 = nullptr;
     bool tested = false;
+    unsigned ds = 0;   // DsBits of the bound state
 };
 DrawSnap g_Snap;
+
+// What a depth-stencil state does, by its pointer. The objects are immutable,
+// so the description is read once per state instead of on every draw (two
+// runtime calls and a reference count each, ~600 draws a frame). A slot whose
+// state was freed and its address reused would answer wrongly; the game keeps
+// its states for the session, and a wrong answer costs one frame's counters.
+enum : unsigned { kDsPresent = 1, kDsTest = 2, kDsWrite = 4, kDsStencilWrite = 8 };
+constexpr int kDsCache = 64;
+struct DsSlot { const void* state; unsigned bits; };
+DsSlot g_DsCache[kDsCache] = {};
+int g_DsCacheNext = 0;
+std::atomic<uint32_t> g_DsCacheMisses{0};
+
+unsigned DsBitsOf(const D3D11_DEPTH_STENCIL_DESC& dd) {
+    unsigned b = kDsPresent;
+    if (dd.DepthEnable) b |= kDsTest;
+    if (dd.DepthEnable && dd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL) b |= kDsWrite;
+    const D3D11_DEPTH_STENCILOP_DESC& f = dd.FrontFace;
+    const D3D11_DEPTH_STENCILOP_DESC& k = dd.BackFace;
+    if (dd.StencilEnable && dd.StencilWriteMask &&
+        (f.StencilPassOp != D3D11_STENCIL_OP_KEEP || f.StencilFailOp != D3D11_STENCIL_OP_KEEP ||
+         f.StencilDepthFailOp != D3D11_STENCIL_OP_KEEP || k.StencilPassOp != D3D11_STENCIL_OP_KEEP ||
+         k.StencilFailOp != D3D11_STENCIL_OP_KEEP || k.StencilDepthFailOp != D3D11_STENCIL_OP_KEEP))
+        b |= kDsStencilWrite;
+    return b;
+}
 
 struct SnapScope {
     explicit SnapScope(ID3D11DeviceContext* c) { g_Snap.ctx = c; g_Snap.have = 0; }
@@ -936,16 +1042,56 @@ const void* BoundVb0(ID3D11DeviceContext* c) {
     return vb;
 }
 
+// A view's resource, by the view's pointer: views are immutable too, and the
+// GetResource and Release pair is half of what reading a bound target costs.
+// Same reuse caveat as the state cache. Render thread.
+constexpr int kViewCache = 32;
+struct ViewSlot { const void* view; const void* res; };
+ViewSlot g_ViewCache[kViewCache] = {};
+int g_ViewCacheNext = 0;
+
+const void* ResourceOf(ID3D11View* v) {
+    if (!v) return nullptr;
+    for (const ViewSlot& e : g_ViewCache)
+        if (e.view == v) return e.res;
+    ID3D11Resource* r = nullptr;
+    v->GetResource(&r);
+    if (r) r->Release();   // compared only
+    g_ViewCache[g_ViewCacheNext] = { v, r };
+    g_ViewCacheNext = (g_ViewCacheNext + 1) % kViewCache;
+    return r;
+}
+
+// The bound depth-stencil state's kDs* bits, 0 with none bound. Render thread.
+unsigned DsBits(ID3D11DeviceContext* c) {
+    if (SnapHas(c, kSnapDs)) return g_Snap.ds;
+    ID3D11DepthStencilState* ds = nullptr;
+    UINT ref = 0;
+    c->OMGetDepthStencilState(&ds, &ref);
+    unsigned bits = 0;
+    if (ds) {
+        ds->Release();   // only the address is kept, as a key
+        for (const DsSlot& e : g_DsCache)
+            if (e.state == ds) { bits = e.bits; break; }
+        if (!bits) {
+            D3D11_DEPTH_STENCIL_DESC dd = {};
+            ds->GetDesc(&dd);
+            bits = DsBitsOf(dd);
+            g_DsCache[g_DsCacheNext] = { ds, bits };
+            g_DsCacheNext = (g_DsCacheNext + 1) % kDsCache;
+            g_DsCacheMisses.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (g_Snap.ctx == c) { g_Snap.ds = bits; g_Snap.tested = (bits & kDsTest) != 0; g_Snap.have |= kSnapDs; }
+    return bits;
+}
+
 const void* BoundDsvResource(ID3D11DeviceContext* c) {
     if (SnapHas(c, kSnapDsv)) return g_Snap.dsv;
     ID3D11DepthStencilView* dsv = nullptr;
     c->OMGetRenderTargets(0, nullptr, &dsv);
-    ID3D11Resource* r = nullptr;
-    if (dsv) {
-        dsv->GetResource(&r);
-        dsv->Release();
-        if (r) r->Release();
-    }
+    const void* r = ResourceOf(dsv);
+    if (dsv) dsv->Release();
     if (g_Snap.ctx == c) { g_Snap.dsv = r; g_Snap.have |= kSnapDsv; }
     return r;
 }
@@ -954,12 +1100,8 @@ const void* BoundRtResource(ID3D11DeviceContext* c) {
     if (SnapHas(c, kSnapRt)) return g_Snap.rt;
     ID3D11RenderTargetView* rtv = nullptr;
     c->OMGetRenderTargets(1, &rtv, nullptr);
-    ID3D11Resource* r = nullptr;
-    if (rtv) {
-        rtv->GetResource(&r);
-        rtv->Release();
-        if (r) r->Release();
-    }
+    const void* r = ResourceOf(rtv);
+    if (rtv) rtv->Release();
     if (g_Snap.ctx == c) { g_Snap.rt = r; g_Snap.have |= kSnapRt; }
     return r;
 }
@@ -1014,7 +1156,7 @@ void CopyNow(ID3D11DeviceContext* c, uint32_t frame) {
     // it since: then it holds only the far plane, and the copy taken at that
     // clear (the world's depth) stays.
     if (g_DepthClearFrame != frame || g_WritesSinceClear)
-        g_DepthReady = g_PsUsesDepth.load(std::memory_order_relaxed) && CopyDepth(c);
+        g_DepthReady = AnyDepth() && CopyDepth(c);
     g_SceneFrame = frame;
 }
 
@@ -1295,7 +1437,7 @@ void RingDump(ID3D11DeviceContext* c) {
 // copy taken between them showed the skin through the see-through window.
 void CopyLateRun(ID3D11DeviceContext* c, uint32_t frame) {
     if (g_CopiedRun < 0 || g_Run <= g_CopiedRun || g_Run >= kMaxRuns || !InVmRun(frame)) return;
-    if ((g_LateRunsCopied >> g_Run & 1) || !g_PsUsesScene.load(std::memory_order_relaxed)) return;
+    if ((g_LateRunsCopied >> g_Run & 1) || !AnyScene()) return;
     if (BoundRtResource(c) != g_MainRt) return;
     g_LateRunsCopied |= 1ull << g_Run;
     if (CopyScene(c)) { Hold(g_VmSceneSrv, g_SceneSrv); g_VmSceneFrame = frame; }
@@ -1307,7 +1449,7 @@ void CopyLateRun(ID3D11DeviceContext* c, uint32_t frame) {
 // marked draws (the inspect-like hold, 2026-10-15); a copy at our run's start
 // then held the engine's black knife and the see-through showed it.
 void CopyBeforeWeapon(ID3D11DeviceContext* c, uint32_t frame) {
-    if (g_SceneDoneFrame == frame || !g_PsUsesScene.load(std::memory_order_relaxed)) return;
+    if (g_SceneDoneFrame == frame || !AnyScene()) return;
     if (!g_MainRt || BoundRtResource(c) != g_MainRt) return;
     if (g_PredictedRun >= 0 && g_Run > g_PredictedRun && !InVmRun(frame)) return;
     // Not before the viewmodel run: the in-hand weapon's vertex buffer is a
@@ -1511,6 +1653,7 @@ bool DecodeImage(const char* path, uint8_t** pixels, UINT* w, UINT* h) {
 // copy went to a shadow pass and the viewmodel fell back to copying at its own
 // draw, the pistol already in the picture.
 bool HasColorTarget(ID3D11DeviceContext* c) {
+    if (SnapHas(c, kSnapRt)) return g_Snap.rt != nullptr;
     ID3D11RenderTargetView* rtv = nullptr;
     c->OMGetRenderTargets(1, &rtv, nullptr);
     if (!rtv) return false;
@@ -1617,8 +1760,11 @@ std::atomic<uint32_t> g_VmDepthLateKept{0};
 
 bool PrepareVmDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* mainDsv, uint32_t frame) {
     const bool late = g_LateStartFrame == frame;
-    if (g_VmDepthFrame == frame && g_VmDepthClearGen == g_MainDepthClears && (!late || g_VmDepthKept)) {
-        if (g_VmDepthEarly) { g_VmDepthEarly = false; g_VmDepthRun = g_Run; }
+    // An early clear stays good through later depth clears of the main depth
+    // as long as its stencil is still the value we cleared ours to.
+    const bool earlyValid = g_VmDepthEarly && g_MainStencilKnown && g_MainStencilValue == g_VmClearedStencil;
+    if (g_VmDepthFrame == frame && (g_VmDepthClearGen == g_MainDepthClears || earlyValid) && (!late || g_VmDepthKept)) {
+        if (g_VmDepthEarly) { g_VmDepthEarly = false; g_VmDepthRun = g_Run; g_VmDepthClearGen = g_MainDepthClears; }
         if (g_VmDepthRun != g_Run) { g_VmDepthRun = g_Run; g_VmDepthKeptAcrossRun.fetch_add(1, std::memory_order_relaxed); }
         return g_VmDepthReady;
     }
@@ -1627,7 +1773,18 @@ bool PrepareVmDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* mainDsv, uin
     g_VmDepthClearGen = g_MainDepthClears;
     g_VmDepthEarly = false;
     g_VmDepthKept = late;
-    const bool known = !late && g_StencilClearFrame == frame && g_StencilClearGen == g_MainDepthClears;
+    const bool known = !late && g_MainStencilKnown;
+    if (known) g_StencilClearValue = g_MainStencilValue;
+    if (!late && !known) {
+        (g_StencilClearFrame != frame ? g_CopyNoEvent : g_CopyClearBetween).fetch_add(1, std::memory_order_relaxed);
+        if (g_ClearsLogged < 3) {
+            ++g_ClearsLogged;
+            Logf("WeaponFX: viewmodel depth copied - frame %u, event frame %u, depth clears %u at the event, %u now, run %d; "
+                 "last clear flags %u stencil %u (event stencil %u), since it depth writes %u, stencil writes %u",
+                 frame, g_StencilClearFrame, g_StencilClearGen, g_MainDepthClears, g_Run, g_LastMainClearFlags,
+                 g_LastMainClearStencil, g_StencilClearValue, g_WritesSinceClear, g_StencilWritesSinceClear);
+        }
+    }
     g_VmDepthReady = FillDepthLike(c, mainDsv, g_VmDepthTex, g_VmDsv, g_VmDepthDesc, g_VmDsvFormat, "viewmodel depth", late,
                                    known ? (int)g_StencilClearValue : -1);
     if (g_VmDepthReady)
@@ -1695,6 +1852,12 @@ bool InViewmodelRun(ID3D11DeviceContext* c, ID3D11DepthStencilView** mainDsv) {
     if (!g_VmDepthOn.load(std::memory_order_relaxed) || !g_DsPre || !g_DsFx) return false;
     const uint32_t frame = g_Frame.load(std::memory_order_relaxed);
     if (c != g_TrackCtx || !InVmRun(frame) || !g_MainDsv) return false;
+    // The viewmodel draws into the screen target (or into none, its depth
+    // pass). After it, with the main depth still bound, the game draws ~70
+    // depth-test-off 2D quads into another target every frame (the HUD,
+    // 2026-10-17 trace); taken for the viewmodel they each got our depth
+    // rebinding and a depth-only pass - ~0.25 ms a frame for nothing.
+    if (HasColorTarget(c) && (!g_MainRt || BoundRtResource(c) != g_MainRt)) return false;
     ID3D11DepthStencilView* dsv = nullptr;
     c->OMGetRenderTargets(0, nullptr, &dsv);
     if (!dsv) return false;
@@ -1741,12 +1904,13 @@ enum NoDepthWhy { kWhyOff, kWhyScene, kWhyNotScreen, kWhyNotMainDepth, kWhyPrepa
 const char* const kNoDepthWhy[kWhyCount] = { "depth off or no shader", "scene reader (by design)", "another colour target",
                                              "another depth target", "depth buffer not prepared" };
 
-bool DrawMissedWeapon(ID3D11DeviceContext* c, IssueFn issue, void* ctx, bool* on, int* why) {
+bool DrawMissedWeapon(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, bool* on, int* why) {
     *on = false;
     *why = kWhyOff;
-    if (!g_VmDepthOn.load(std::memory_order_relaxed) || !g_DsPre || !g_DsFx || !g_Ps.load(std::memory_order_acquire))
+    if (!g_VmDepthOn.load(std::memory_order_relaxed) || !g_DsPre || !g_DsFx ||
+        !g_Prog[target].ps.load(std::memory_order_acquire))
         return false;
-    if (g_PsUsesScene.load(std::memory_order_relaxed)) { *why = kWhyScene; return false; }
+    if (ReadsScene(target)) { *why = kWhyScene; return false; }
     ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     ID3D11DepthStencilView* dsv = nullptr;
     c->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, &dsv);
@@ -1788,7 +1952,7 @@ bool DrawMissedWeapon(ID3D11DeviceContext* c, IssueFn issue, void* ctx, bool* on
     IssueDepthOnly(c, issue, ctx);
     c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, ours);
     Bound fx;
-    *on = Begin(c, fx);
+    *on = Begin(c, target, fx);
     c->OMSetDepthStencilState(g_DsFx, 0);
     issue(ctx);
     End(c, fx);
@@ -1892,7 +2056,7 @@ bool Init(ID3D11Device* dev, LogFn log) {
         return false;
     }
     QueryPerformanceFrequency(&g_Freq);
-    QueryPerformanceCounter(&g_T0);
+    for (Program& p : g_Prog) QueryPerformanceCounter(&p.t0);
     dev->AddRef();
     g_Dev = dev;
     return true;
@@ -1904,9 +2068,14 @@ void Shutdown() {
     WaitForSingleObject(g_Watcher, INFINITE);
     CloseHandle(g_Watcher); g_Watcher = nullptr;
     CloseHandle(g_Stop); g_Stop = nullptr;
-    if (ID3D11PixelShader* ps = g_Ps.exchange(nullptr)) ps->Release();
-    for (auto& t : g_Tex)
-        if (ID3D11ShaderResourceView* v = t.exchange(nullptr)) v->Release();
+    for (Program& p : g_Prog) {
+        if (ID3D11PixelShader* ps = p.ps.exchange(nullptr)) ps->Release();
+        for (auto& t : p.tex)
+            if (ID3D11ShaderResourceView* v = t.exchange(nullptr)) v->Release();
+        if (ID3D11ShaderResourceView* v = p.frames.exchange(nullptr)) v->Release();
+        p.frameCount.store(0);
+        p.path[0] = 0;
+    }
     Hold(g_VmSceneSrv, nullptr);
     Hold(g_VmDepthSrv, nullptr);
     Hold(g_PrevSceneSrv, nullptr);
@@ -1946,37 +2115,56 @@ void Shutdown() {
     if (g_Blend) { g_Blend->Release(); g_Blend = nullptr; }
     g_Dev->Release();
     g_Dev = nullptr;
-    g_Path[0] = 0;
 }
 
-bool Load(const char* path) {
-    if (!g_Dev) return false;
+bool Load(int target, const char* path) {
+    if (!g_Dev || !ValidTarget(target)) return false;
+    Program& p = g_Prog[target];
     AcquireSRWLockExclusive(&g_CompileLock);
     bool ok = true;
     if (!path || !*path) {
-        g_Path[0] = 0;
-        Retire(g_Ps.exchange(nullptr, std::memory_order_acq_rel));
-        Logf("WeaponFX: off");
-    } else if (strlen(path) >= sizeof(g_Path)) {
-        Logf("WeaponFX: path too long");
+        p.path[0] = 0;
+        g_Error[target][0] = 0;
+        Retire(p.ps.exchange(nullptr, std::memory_order_acq_rel));
+        Logf("WeaponFX: %s off", kTargetName[target]);
+    } else if (strlen(path) >= sizeof(p.path)) {
+        Logf("WeaponFX: %s - path too long", kTargetName[target]);
+        strncpy_s(g_Error[target], "path too long", _TRUNCATE);
         ok = false;
     } else {
-        strcpy_s(g_Path, path);
+        strcpy_s(p.path, path);
         g_CopiesTripped.store(false, std::memory_order_relaxed);
         g_MemTripped.store(false, std::memory_order_relaxed);
         g_MemBase = PrivateBytes();
-        ok = CompileLocked();
-        if (ok) { QueryPerformanceCounter(&g_T0); g_Draws = 0; }
+        ok = CompileLocked(target);
+        if (ok) { QueryPerformanceCounter(&p.t0); p.draws = 0; }
     }
     ReleaseSRWLockExclusive(&g_CompileLock);
     return ok;
 }
 
-bool Active() { return g_Ps.load(std::memory_order_acquire) != nullptr; }
+bool Active() { return AnyActive(); }
+bool Active(int target) { return ValidTarget(target) && g_Prog[target].ps.load(std::memory_order_acquire) != nullptr; }
+
+void LastError(int target, char* out, unsigned cap) {
+    if (!out || !cap) return;
+    out[0] = 0;
+    if (!ValidTarget(target)) return;
+    AcquireSRWLockShared(&g_CompileLock);
+    strncpy_s(out, cap, g_Error[target], _TRUNCATE);
+    ReleaseSRWLockShared(&g_CompileLock);
+}
 
 void NewFrame() {
     TimerFrameEnd(g_TrackCtx);
-    g_Frame.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t frame = g_Frame.fetch_add(1, std::memory_order_relaxed) + 1;
+    // The pointer caches forget everything now and then: a target or state
+    // the game freed (a resolution change) and whose address went to another
+    // object is answered wrongly for two seconds at most, not for the session.
+    if ((frame & 127) == 0) {
+        memset(g_ViewCache, 0, sizeof(g_ViewCache));
+        memset(g_DsCache, 0, sizeof(g_DsCache));
+    }
     // The present is on the render thread, the one that owns the context.
     const int ring = g_RingState.load(std::memory_order_relaxed);
     if (ring == 2 && g_TrackCtx) {
@@ -2046,23 +2234,14 @@ bool DbgMiss(uint32_t frame) {
     return n > 0 && frame % (uint32_t)n == 0;
 }
 
-bool DepthTested(ID3D11DeviceContext* c) {
-    if (SnapHas(c, kSnapDs)) return g_Snap.tested;
-    ID3D11DepthStencilState* ds = nullptr;
-    UINT ref = 0;
-    c->OMGetDepthStencilState(&ds, &ref);
-    D3D11_DEPTH_STENCIL_DESC dd = {};
-    if (ds) { ds->GetDesc(&dd); ds->Release(); }
-    const bool tested = ds && dd.DepthEnable;
-    if (g_Snap.ctx == c) { g_Snap.tested = tested; g_Snap.have |= kSnapDs; }
-    return tested;
-}
+bool DepthTested(ID3D11DeviceContext* c) { return (DsBits(c) & kDsTest) != 0; }
 
-bool BeforeDraw(ID3D11DeviceContext* c, bool weapon) {
-    if (!g_Ps.load(std::memory_order_relaxed)) return false;
-    if (!g_PsUsesScene.load(std::memory_order_relaxed) && !g_PsUsesDepth.load(std::memory_order_relaxed) &&
-        !g_VmDepthOn.load(std::memory_order_relaxed))
-        return false;
+bool BeforeDraw(ID3D11DeviceContext* c, int target) {
+    if (!AnyActive()) return false;
+    if (!AnyScene() && !AnyDepth() && !g_VmDepthOn.load(std::memory_order_relaxed)) return false;
+    // Everything below is the shared pipeline: the gloves' draws are marked
+    // draws of the viewmodel run like the weapon's.
+    bool weapon = ValidTarget(target);
     if (weapon && !HasColorTarget(c)) weapon = false;
     if (weapon) g_TrackCtx = c;
     // Deferred contexts record out of order with the immediate one; their
@@ -2081,12 +2260,7 @@ bool BeforeDraw(ID3D11DeviceContext* c, bool weapon) {
     }
     if (g_MainRt && BoundRtResource(c) == g_MainRt) {
         if (g_ShadowRun < 0 && g_StencilClearFrame == frame && g_MainDsv && BoundDsvResource(c) == g_MainDsv) {
-            ID3D11DepthStencilState* ds = nullptr;
-            UINT ref = 0;
-            c->OMGetDepthStencilState(&ds, &ref);
-            D3D11_DEPTH_STENCIL_DESC dd = {};
-            if (ds) { ds->GetDesc(&dd); ds->Release(); }
-            if (ds && dd.DepthEnable && dd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL) {
+            if (DsBits(c) & kDsWrite) {
                 if (g_MainDraws * 2 < g_MainDrawsAtStart) {
                     // Too early: the world is still to come. The next stencil
                     // clear (or the marked draw, below) starts it instead.
@@ -2165,12 +2339,8 @@ bool BeforeDraw(ID3D11DeviceContext* c, bool weapon) {
         CopyLateRun(c, frame);
         if (g_RunWeapon[g_Run] < 0xFFFF) ++g_RunWeapon[g_Run];
         {
-            ID3D11DepthStencilState* ds = nullptr;
-            UINT ref = 0;
-            c->OMGetDepthStencilState(&ds, &ref);
-            D3D11_DEPTH_STENCIL_DESC dd = {};
-            if (ds) { ds->GetDesc(&dd); ds->Release(); }
-            if (ds && !dd.DepthEnable && g_RunNoZ[g_Run] < 0xFFFF) ++g_RunNoZ[g_Run];
+            const unsigned dsb = DsBits(c);
+            if ((dsb & kDsPresent) && !(dsb & kDsTest) && g_RunNoZ[g_Run] < 0xFFFF) ++g_RunNoZ[g_Run];
             if (!g_RunRtW[g_Run]) g_RunRtW[g_Run] = RtWidth(c);
         }
         if (g_CopiedRun >= 0 && g_Run >= g_CopiedRun && (g_VmRuns >> (g_Run - g_CopiedRun) & 1)) {
@@ -2197,17 +2367,14 @@ bool BeforeDraw(ID3D11DeviceContext* c, bool weapon) {
         }
     }
     {
-        ID3D11DepthStencilState* ds = nullptr;
-        UINT ref = 0;
-        c->OMGetDepthStencilState(&ds, &ref);
-        if (ds) {
-            D3D11_DEPTH_STENCIL_DESC dd = {};
-            ds->GetDesc(&dd);
-            ds->Release();
-            if (dd.DepthEnable && dd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL) {
-                if (g_RunWrites[g_Run] < 0xFFFF && HasColorTarget(c)) ++g_RunWrites[g_Run];
-                if (g_MainDsv && BoundDsvResource(c) == g_MainDsv) ++g_WritesSinceClear;
-            }
+        const unsigned dsb = DsBits(c);
+        if (dsb & kDsWrite) {
+            if (g_RunWrites[g_Run] < 0xFFFF && HasColorTarget(c)) ++g_RunWrites[g_Run];
+            if (g_MainDsv && BoundDsvResource(c) == g_MainDsv) ++g_WritesSinceClear;
+        }
+        if ((dsb & kDsStencilWrite) && g_MainDsv && BoundDsvResource(c) == g_MainDsv) {
+            ++g_StencilWritesSinceClear;
+            g_MainStencilKnown = false;
         }
     }
     // The prepass draw of the weapon in hands: its vertex buffer, no colour
@@ -2221,6 +2388,23 @@ bool BeforeDraw(ID3D11DeviceContext* c, bool weapon) {
     return true;
 }
 
+// Our viewmodel depth cleared to (far, `stencil`) next to a clear of the main
+// depth, ahead of the viewmodel run; PrepareVmDepth takes it while the main
+// stencil stays that value.
+void EarlyVmClear(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, const void* res, uint32_t frame, uint8_t stencil) {
+    if (!g_VmDepthOn.load(std::memory_order_relaxed) || !VmDepthFits(dsv, res)) return;
+    {
+        TimedCopy tc(c);
+        c->ClearDepthStencilView(g_VmDsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, stencil);
+    }
+    g_VmDepthFrame = frame;
+    g_VmDepthClearGen = g_MainDepthClears;
+    g_VmClearedStencil = stencil;
+    g_VmDepthReady = true;
+    g_VmDepthEarly = true;
+    g_VmDepthEarlyAll.fetch_add(1, std::memory_order_relaxed);
+}
+
 void BeforeClearDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, unsigned flags, uint8_t stencil) {
     // Clears count in the bisect, as they do in a dump of the frame's draws.
     if (dsv && c == g_TrackCtx && g_DbgDepthAt.load(std::memory_order_relaxed) == g_DbgDrawIdx++ &&
@@ -2228,7 +2412,7 @@ void BeforeClearDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, unsig
         DbgCopyAt(c, dsv);
     if (!(flags & D3D11_CLEAR_DEPTH)) {
         // Stencil only: the shadow start's event.
-        if (dsv && c == g_TrackCtx && g_MainDsv && g_Ps.load(std::memory_order_relaxed)) {
+        if (dsv && c == g_TrackCtx && g_MainDsv && AnyActive()) {
             ID3D11Resource* r = nullptr;
             dsv->GetResource(&r);
             if (r) r->Release();
@@ -2238,17 +2422,11 @@ void BeforeClearDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, unsig
                 g_StencilClearFrame = frame;
                 g_StencilClearValue = stencil;
                 g_StencilClearGen = g_MainDepthClears;
-                if (g_VmDepthOn.load(std::memory_order_relaxed) && VmDepthFits(dsv, r)) {
-                    {
-                        TimedCopy tc(c);
-                        c->ClearDepthStencilView(g_VmDsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, stencil);
-                    }
-                    g_VmDepthFrame = frame;
-                    g_VmDepthClearGen = g_MainDepthClears;
-                    g_VmDepthReady = true;
-                    g_VmDepthEarly = true;
-                    g_VmDepthEarlyAll.fetch_add(1, std::memory_order_relaxed);
+                if (flags & D3D11_CLEAR_STENCIL) {
+                    g_MainStencilKnown = true;
+                    g_MainStencilValue = stencil;
                 }
+                EarlyVmClear(c, dsv, r, frame, stencil);
             }
         }
         return;
@@ -2257,9 +2435,24 @@ void BeforeClearDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, unsig
         ID3D11Resource* r = nullptr;
         dsv->GetResource(&r);
         if (r) r->Release();
-        if (r == g_MainDsv) ++g_MainDepthClears;
+        if (r == g_MainDsv) {
+            ++g_MainDepthClears;
+            g_LastMainClearFlags = flags;
+            g_LastMainClearStencil = stencil;
+            g_StencilWritesSinceClear = 0;
+            if (flags & D3D11_CLEAR_STENCIL) {
+                g_MainStencilKnown = true;
+                g_MainStencilValue = stencil;
+            }
+            // Ours next to the game's own clear, where the GPU wait a clear
+            // brings is already paid - only after this frame's stencil event:
+            // the depth clears before it are other passes' (BeforeClearDepth
+            // header), and a clear of ours there would be wasted.
+            const uint32_t now = g_Frame.load(std::memory_order_relaxed);
+            if (g_MainStencilKnown && g_StencilClearFrame == now) EarlyVmClear(c, dsv, r, now, g_MainStencilValue);
+        }
     }
-    if (!dsv || !g_Ps.load(std::memory_order_relaxed) || !g_PsUsesDepth.load(std::memory_order_relaxed)) return;
+    if (!dsv || !AnyDepth()) return;
     if (c != g_TrackCtx || !g_MainDsv) return;
     const uint32_t frame = g_Frame.load(std::memory_order_relaxed);
     if (g_TrackFrame != frame) RollFrame(frame);
@@ -2277,16 +2470,18 @@ void BeforeClearDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, unsig
     }
 }
 
-bool LoadTexture(int index, const char* path) {
-    if (!g_Dev || index < 0 || index >= kTextures) return false;
+bool LoadTexture(int target, int index, const char* path) {
+    if (!g_Dev || !ValidTarget(target) || index < 0 || index >= kTextures) return false;
+    std::atomic<ID3D11ShaderResourceView*>& slot = g_Prog[target].tex[index];
+    const char* who = kTargetName[target];
     if (!path || !*path) {
-        Retire(g_Tex[index].exchange(nullptr, std::memory_order_acq_rel));
-        Logf("WeaponFX: texture %d off", index);
+        Retire(slot.exchange(nullptr, std::memory_order_acq_rel));
+        Logf("WeaponFX: %s texture %d off", who, index);
         return true;
     }
     uint8_t* px = nullptr;
     UINT w = 0, h = 0;
-    if (!DecodeImage(path, &px, &w, &h)) { Logf("WeaponFX: texture %d - cannot decode %s", index, path); return false; }
+    if (!DecodeImage(path, &px, &w, &h)) { Logf("WeaponFX: %s texture %d - cannot decode %s", who, index, path); return false; }
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = w;
     td.Height = h;
@@ -2305,23 +2500,53 @@ bool LoadTexture(int index, const char* path) {
                     SUCCEEDED(g_Dev->CreateShaderResourceView(tex, nullptr, &srv)) && srv;
     HeapFree(GetProcessHeap(), 0, px);
     if (tex) tex->Release();   // the view holds it
-    if (!ok) { Logf("WeaponFX: texture %d - upload failed (%ux%u)", index, w, h); return false; }
-    Retire(g_Tex[index].exchange(srv, std::memory_order_acq_rel));
-    Logf("WeaponFX: texture %d = %s (%ux%u)", index, path, w, h);
+    if (!ok) { Logf("WeaponFX: %s texture %d - upload failed (%ux%u)", who, index, w, h); return false; }
+    Retire(slot.exchange(srv, std::memory_order_acq_rel));
+    Logf("WeaponFX: %s texture %d = %s (%ux%u)", who, index, path, w, h);
     return true;
 }
 
-void SetParam(int index, float x, float y, float z, float w) {
-    if (index < 0 || index >= kParams) return;
-    g_Param[index][0].store(x, std::memory_order_relaxed);
-    g_Param[index][1].store(y, std::memory_order_relaxed);
-    g_Param[index][2].store(z, std::memory_order_relaxed);
-    g_Param[index][3].store(w, std::memory_order_relaxed);
+void SetParam(int target, int index, float x, float y, float z, float w) {
+    if (!ValidTarget(target) || index < 0 || index >= kParams) return;
+    std::atomic<float>* p = g_Prog[target].param[index];
+    p[0].store(x, std::memory_order_relaxed);
+    p[1].store(y, std::memory_order_relaxed);
+    p[2].store(z, std::memory_order_relaxed);
+    p[3].store(w, std::memory_order_relaxed);
 }
 
-bool Begin(ID3D11DeviceContext* c, Bound& saved) {
+bool SetFrames(int target, ID3D11ShaderResourceView* frames, float fps) {
+    if (!ValidTarget(target)) return false;
+    Program& prog = g_Prog[target];
+    uint32_t count = 0;
+    if (frames) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC d = {};
+        frames->GetDesc(&d);
+        // A plain 2D view would bind and sample as garbage behind a
+        // Texture2DArray declaration with no error anywhere.
+        if (d.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2DARRAY || d.Texture2DArray.ArraySize == 0 ||
+            !(fps > 0.0f && fps <= 1000.0f)) {
+            Logf("WeaponFX: %s frames refused (not a texture array, or fps %.3f)", kTargetName[target], fps);
+            return false;
+        }
+        count = d.Texture2DArray.ArraySize;
+        frames->AddRef();
+    }
+    // Count first to zero, then the view, then the count: a draw between the
+    // stores sees either no frames or a view with a count that fits it.
+    prog.frameCount.store(0, std::memory_order_release);
+    prog.frameFps.store(fps, std::memory_order_relaxed);
+    Retire(prog.frames.exchange(frames, std::memory_order_acq_rel));
+    prog.frameCount.store(count, std::memory_order_release);
+    Logf("WeaponFX: %s frames %s (%u at %.2f fps)", kTargetName[target], frames ? "set" : "off", count, fps);
+    return true;
+}
+
+bool Begin(ID3D11DeviceContext* c, int target, Bound& saved) {
     saved = {};
-    ID3D11PixelShader* ours = g_Ps.load(std::memory_order_acquire);
+    if (!ValidTarget(target)) return false;
+    Program& prog = g_Prog[target];
+    ID3D11PixelShader* ours = prog.ps.load(std::memory_order_acquire);
     if (!ours || !g_Cb || !HasColorTarget(c)) return false;
 
     FxConstants k = {};
@@ -2329,9 +2554,10 @@ bool Begin(ID3D11DeviceContext* c, Bound& saved) {
     QueryPerformanceCounter(&now);
     const int64_t prev = g_LastTick.exchange(now.QuadPart, std::memory_order_relaxed);
     const double freq = g_Freq.QuadPart ? (double)g_Freq.QuadPart : 1.0;
-    k.time[0] = (float)((double)(now.QuadPart - g_T0.QuadPart) / freq);
+    k.time[0] = (float)((double)(now.QuadPart - prog.t0.QuadPart) / freq);
     k.time[1] = prev ? (float)((double)(now.QuadPart - prev) / freq) : 0.0f;
-    k.time[2] = (float)g_Draws.fetch_add(1, std::memory_order_relaxed);
+    k.time[2] = (float)prog.draws.fetch_add(1, std::memory_order_relaxed);
+    k.time[3] = (float)target;   // IsGloves() in weaponfx.hlsli
     D3D11_VIEWPORT vp = {};
     UINT nvp = 1;
     c->RSGetViewports(&nvp, &vp);
@@ -2342,7 +2568,15 @@ bool Begin(ID3D11DeviceContext* c, Bound& saved) {
         k.screen[3] = 1.0f / vp.Height;
     }
     for (int i = 0; i < kParams; ++i)
-        for (int j = 0; j < 4; ++j) k.param[i][j] = g_Param[i][j].load(std::memory_order_relaxed);
+        for (int j = 0; j < 4; ++j) k.param[i][j] = prog.param[i][j].load(std::memory_order_relaxed);
+    ID3D11ShaderResourceView* frameView = prog.frames.load(std::memory_order_acquire);
+    const uint32_t frameCount = prog.frameCount.load(std::memory_order_acquire);
+    if (frameView && frameCount) {
+        k.frames[0] = (float)frameCount;
+        k.frames[1] = prog.frameFps.load(std::memory_order_relaxed);
+    } else {
+        frameView = nullptr;
+    }
 
     D3D11_MAPPED_SUBRESOURCE m = {};
     if (FAILED(c->Map(g_Cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)) || !m.pData) return false;
@@ -2352,8 +2586,8 @@ bool Begin(ID3D11DeviceContext* c, Bound& saved) {
     // Before our shader is bound: the copy has to hold what was under the
     // weapon, not the weapon.
     ID3D11ShaderResourceView* views[kViews] = {};
-    const bool scene = g_PsUsesScene.load(std::memory_order_acquire);
-    const bool depth = g_PsUsesDepth.load(std::memory_order_acquire);
+    const bool scene = prog.usesScene.load(std::memory_order_acquire);
+    const bool depth = prog.usesDepth.load(std::memory_order_acquire);
     const bool copies = (scene || depth) && EnsureCopies(c);
     if (scene && copies) views[0] = g_SceneSrv;
     if (scene && copies) views[2 + kTextures] = g_PrevSceneSrv;
@@ -2368,7 +2602,8 @@ bool Begin(ID3D11DeviceContext* c, Bound& saved) {
     if (g_Trace == 2)
         Logf("WeaponFX: trace #%d run %d our draw, copies %d, rt %p, scene view %p", g_DbgDrawIdx - 1, g_Run, (int)copies,
              BoundRtResource(c), (void*)(copies ? g_SceneSrv : nullptr));
-    for (int i = 0; i < kTextures; ++i) views[1 + i] = g_Tex[i].load(std::memory_order_acquire);
+    for (int i = 0; i < kTextures; ++i) views[1 + i] = prog.tex[i].load(std::memory_order_acquire);
+    views[kFramesView] = frameView;
     if (depth && copies && g_DepthReady) views[1 + kTextures] = g_DepthSrv;
     if (depth && g_DbgDepthAt.load(std::memory_order_relaxed) >= 0 && g_DbgDepthSrv) views[1 + kTextures] = g_DbgDepthSrv;
     if (scene && g_DbgDepthAt.load(std::memory_order_relaxed) >= 0 && g_DbgSceneSrv) views[0] = g_DbgSceneSrv;
@@ -2401,31 +2636,35 @@ void End(ID3D11DeviceContext* c, Bound& saved) {
 }
 
 namespace {
-bool DrawInner(ID3D11DeviceContext* c, bool weapon, IssueFn issue, void* ctx);
+bool DrawInner(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx);
 }
 
-bool Draw(ID3D11DeviceContext* c, bool weapon, IssueFn issue, void* ctx, uint64_t key) {
-    if (!weapon || !g_Ps.load(std::memory_order_relaxed) || c != g_TrackCtx) return DrawInner(c, weapon, issue, ctx);
+bool Draw(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uint64_t key) {
+    if (!ValidTarget(target) || !g_Prog[target].ps.load(std::memory_order_relaxed) || c != g_TrackCtx)
+        return DrawInner(c, target, issue, ctx);
     const uint32_t frame = g_Frame.load(std::memory_order_relaxed);
     const DrawSig sig = SigOf(c, key);
     if (key && g_LastSigFrame == frame && memcmp(&sig, &g_LastSig, sizeof(sig)) == 0) ++g_FrameDups;
     g_LastSig = sig;
     g_LastSigFrame = frame;
     const int t = TimerOpen(c, kTimeDraw);
-    const bool on = DrawInner(c, weapon, issue, ctx);
+    const bool on = DrawInner(c, target, issue, ctx);
     TimerClose(c, t);
     return on;
 }
 
 namespace {
-bool DrawInner(ID3D11DeviceContext* c, bool weapon, IssueFn issue, void* ctx) {
+bool DrawInner(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx) {
+    // A marked draw whose target has no shader (the gloves marked while their
+    // shader failed to load) is issued as the engine's own, not with ours.
+    const bool weapon = ValidTarget(target) && g_Prog[target].ps.load(std::memory_order_relaxed);
     Bound fx;
     ID3D11DepthStencilView* mainDsv = nullptr;
     if (!InViewmodelRun(c, &mainDsv)) {
         bool drawn = false;
         int why = kWhyOff;
-        if (weapon && DrawMissedWeapon(c, issue, ctx, &drawn, &why)) return drawn;
-        const bool on = weapon && Begin(c, fx);
+        if (weapon && DrawMissedWeapon(c, target, issue, ctx, &drawn, &why)) return drawn;
+        const bool on = weapon && Begin(c, target, fx);
         if (on) NoteNoDepth(c, why);
         issue(ctx);
         End(c, fx);
@@ -2458,8 +2697,45 @@ bool DrawInner(ID3D11DeviceContext* c, bool weapon, IssueFn issue, void* ctx) {
     // scene on its far side anyway; the fingers still hide it - they are
     // drawn first and write depth. Opaque effects keep the pass: without it
     // their far side shows through the near one.
-    const bool selfDepth = weapon && !g_PsUsesScene.load(std::memory_order_relaxed);
-    if (selfDepth || (!weapon && !writes && !weaponPass)) {
+    const bool selfDepth = weapon && !ReadsScene(target);
+    const bool noPre = (g_DebugBits.load(std::memory_order_relaxed) & kDbgNoVmPrepass) && !weapon;
+    {
+        const uint32_t frame = g_Frame.load(std::memory_order_relaxed);
+        if ((g_DebugBits.load(std::memory_order_relaxed) & kDbgTraceVm) && g_VmTraceFrame == ~0u) {
+            g_VmTraceFrame = frame;
+            g_VmTraceLines = 0;
+        }
+        if (g_VmTraceFrame == frame && g_VmTraceLines < 160) {
+            ++g_VmTraceLines;
+            D3D11_VIEWPORT vp = {};
+            UINT nvp = 1;
+            c->RSGetViewports(&nvp, &vp);
+            ID3D11PixelShader* ps = nullptr;
+            c->PSGetShader(&ps, nullptr, nullptr);
+            if (ps) ps->Release();
+            ID3D11BlendState* bs = nullptr;
+            float bf[4];
+            UINT sm = 0;
+            c->OMGetBlendState(&bs, bf, &sm);
+            D3D11_BLEND_DESC bd = {};
+            if (bs) { bs->GetDesc(&bd); bs->Release(); }
+            int nrt = 0;
+            for (ID3D11RenderTargetView* v : rtv) nrt += v ? 1 : 0;
+            Logf("WeaponFX: vm #%d run %d target %d ds %d z %d w %d func %d st %d ref %u | rt %d main %d vp %.0fx%.0f "
+                 "ps %p blend %d vb %p",
+                 g_VmTraceLines, g_Run, target, ds ? 1 : 0, (int)dd.DepthEnable, (int)dd.DepthWriteMask, (int)dd.DepthFunc,
+                 (int)dd.StencilEnable, ref, nrt, rtv[0] && BoundRtResource(c) == g_MainRt ? 1 : 0, vp.Width, vp.Height,
+                 (void*)ps, (int)bd.RenderTarget[0].BlendEnable, (void*)BoundVb0(c));
+        } else if (g_VmTraceFrame != ~0u && g_VmTraceFrame != frame) {
+            g_VmTraceFrame = ~0u;
+            g_DebugBits.fetch_and(~(unsigned)kDbgTraceVm, std::memory_order_relaxed);
+        }
+    }
+    if (!noPre && (selfDepth || (!weapon && !writes && !weaponPass))) {
+        if (!weapon) {
+            if (!ds || !dd.DepthEnable) g_PreNoTest.fetch_add(1, std::memory_order_relaxed);
+            else if (dd.DepthFunc >= 1 && dd.DepthFunc <= 8) g_PreFunc[dd.DepthFunc].fetch_add(1, std::memory_order_relaxed);
+        }
         c->OMSetRenderTargets(0, nullptr, g_VmDsv);
         c->OMSetDepthStencilState(g_DsPre, 0);
         if (weapon) IssueDepthOnly(c, issue, ctx);
@@ -2467,7 +2743,7 @@ bool DrawInner(ID3D11DeviceContext* c, bool weapon, IssueFn issue, void* ctx) {
         g_VmDepthPre.fetch_add(1, std::memory_order_relaxed);
     }
     c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, g_VmDsv);
-    const bool on = weapon && Begin(c, fx);
+    const bool on = weapon && Begin(c, target, fx);
     // Ours tests against the depth pass it just laid down (equal passes), or
     // only against the hands for a scene reader; theirs keep their own state,
     // stencil included.
@@ -2476,7 +2752,7 @@ bool DrawInner(ID3D11DeviceContext* c, bool weapon, IssueFn issue, void* ctx) {
     // writes it, the hand drawn after it then failed behind the weapon, and
     // the see-through window showed the black the copy holds there (no world
     // behind a hand, no hand yet).
-    const bool quiet = weaponPass && writes && g_PsUsesScene.load(std::memory_order_relaxed);
+    const bool quiet = weaponPass && writes && AnyScene();
     c->OMSetDepthStencilState(on || quiet ? g_DsFx : ds, on || quiet ? 0 : ref);
     issue(ctx);
     End(c, fx);
@@ -2491,6 +2767,12 @@ bool DrawInner(ID3D11DeviceContext* c, bool weapon, IssueFn issue, void* ctx) {
 }
 
 } // namespace
+
+void SetDebugBits(unsigned bits) {
+    g_DebugBits.store(bits, std::memory_order_relaxed);
+    Logf("WeaponFX: debug bits 0x%X", bits);
+}
+unsigned DebugBits() { return g_DebugBits.load(std::memory_order_relaxed); }
 
 void SetViewmodelDepth(bool on) {
     g_VmDepthOn.store(on, std::memory_order_relaxed);
@@ -2514,14 +2796,18 @@ void DebugMissEvery(int n) {
 // Three lines: the host's log cuts a line at 512 characters, and one line
 // lost its tail - the detection counters - exactly when they were needed.
 void Report() {
-    int texs = 0;
-    for (const auto& t : g_Tex) texs += t.load() ? 1 : 0;
-    Logf("WeaponFX: %s | shader %s%s%s | compiles %u, failures %u | draws %u | textures %d | "
-         "scene copies %u, skipped %u | depth copies %u, skipped %u | copy textures made %u%s, retire evictions %u",
-         g_Path[0] ? g_Path : "(no file)", Active() ? "bound" : "none",
-         g_PsUsesScene.load() ? " (reads the scene)" : "", g_PsUsesDepth.load() ? " (reads depth)" : "",
-         g_Compiles.load(), g_Failures.load(), g_Draws.load(), texs, g_SceneCopies.load(), g_SceneSkips.load(),
-         g_DepthCopies.load(), g_DepthSkips.load(), g_CopyCreates.load(),
+    AcquireSRWLockShared(&g_CompileLock);
+    for (int t = 0; t < kTargets; ++t) {
+        const Program& p = g_Prog[t];
+        int texs = 0;
+        for (const auto& x : p.tex) texs += x.load() ? 1 : 0;
+        Logf("WeaponFX: %s - %s | shader %s%s%s | compiles %u, failures %u | draws %u | textures %d", kTargetName[t],
+             p.path[0] ? p.path : "(no file)", p.ps.load() ? "bound" : "none", p.usesScene.load() ? " (reads the scene)" : "",
+             p.usesDepth.load() ? " (reads depth)" : "", p.compiles.load(), p.failures.load(), p.draws.load(), texs);
+    }
+    ReleaseSRWLockShared(&g_CompileLock);
+    Logf("WeaponFX: scene copies %u, skipped %u | depth copies %u, skipped %u | copy textures made %u%s, retire evictions %u",
+         g_SceneCopies.load(), g_SceneSkips.load(), g_DepthCopies.load(), g_DepthSkips.load(), g_CopyCreates.load(),
          g_MemTripped.load() ? " (MEMORY GUARD OFF)" : g_CopiesTripped.load() ? " (FUSE OUT)" : "", g_GraveEvictions.load());
     Logf("WeaponFX: viewmodel start - by the stencil event: agree %u, wrong %u, none %u, refused early %u | "
          "late (at a marked draw) %u, refused on the buffer alone %u | frames covered by the last good copy %u | "
@@ -2538,6 +2824,12 @@ void Report() {
     Logf("WeaponFX: viewmodel depth made at the game's stencil clear %u, by a clear at the first draw %u, by a copy %u, "
          "kept as it is for a late start %u",
          g_VmDepthEarlyAll.load(), g_VmDepthCleared.load(), g_VmDepthCopiedAll.load(), g_VmDepthLateKept.load());
+    Logf("WeaponFX: viewmodel depth copies - no stencil event that frame %u, a depth clear between it and the run %u",
+         g_CopyNoEvent.load(), g_CopyClearBetween.load());
+    Logf("WeaponFX: depth-only passes before non-writing viewmodel draws - test off %u, by func never %u less %u "
+         "equal %u less_equal %u greater %u not_equal %u greater_equal %u always %u",
+         g_PreNoTest.load(), g_PreFunc[1].load(), g_PreFunc[2].load(), g_PreFunc[3].load(), g_PreFunc[4].load(),
+         g_PreFunc[5].load(), g_PreFunc[6].load(), g_PreFunc[7].load(), g_PreFunc[8].load());
     Logf("WeaponFX: weapon frames without our depth (not scene readers) %u", g_NoDepthAll.load());
 }
 

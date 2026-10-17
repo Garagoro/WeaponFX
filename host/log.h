@@ -30,6 +30,15 @@ bool Narrow(const wchar_t* wide, char* out, int cap);
 // than the buffer is cut, never overrun.
 void Log(const char* fmt, ...);
 
+// For a host that embeds WeaponFX (the skin editor) and keeps its own folder
+// and log. Both before anything else here runs - DataDir() resolves once.
+// `dir`: UTF-8, created when missing (one level), a trailing backslash added.
+void SetDataDir(const char* dir);
+// Lines go to `sink` (untimestamped: the host stamps its own) instead of
+// weaponfx.log. Null puts the file back.
+using LogSink = void (*)(const char* line);
+void SetLogSink(LogSink sink);
+
 // The module this code lives in when the loader knows it (LoadLibrary), or
 // null (manual map). For FreeLibraryAndExitThread.
 void* SelfModule();

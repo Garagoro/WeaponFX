@@ -4,8 +4,13 @@
 //
 // The core knows nothing of the game: it depends on d3d11 and Win32 only, and
 // the host (host/) hands in a log sink and the device. The host owns the draw
-// interception and calls Begin/End around the one draw it decided is the
-// weapon.
+// interception and tells the core, per draw, whose it is: the weapon's, the
+// gloves', or neither.
+//
+// Two targets, each with its own shader file, textures and parameters (a
+// "program"): the weapon in hands and the gloves. They share everything else -
+// the scene copy, the viewmodel run tracking, the viewmodel depth - because
+// both are drawn in the same viewmodel runs of one frame.
 //
 // Threads: Init/Shutdown/Load/SetParam on any one control thread; Begin/End
 // on whatever thread issues the draw. A watcher thread of our own recompiles
@@ -26,6 +31,10 @@ namespace WeaponFx {
 
 using LogFn = void (*)(const char* line);
 
+// Whose a draw is. kNone: not ours to paint (still counted by the pipeline).
+enum Target : int { kNone = -1, kWeapon = 0, kGloves = 1 };
+constexpr int kTargets = 2;
+
 // Our constant buffer's register. The engine's weapon PS uses b0..b5; the
 // top slot is the one least likely to collide with a future combo. Restored
 // after every draw, so a collision costs a wrong-looking weapon, not state.
@@ -35,10 +44,12 @@ constexpr int kParams = 4;   // float4 g_fxParam[kParams]
 // t32 g_fxScene - the scene behind the weapon; t33..t36 g_fxTex0..3 - files;
 // t37 g_fxDepth - the scene's depth at the same moment; t38 g_fxScenePrev -
 // last frame's g_fxScene, the fallback SceneAt() reads. The copies are
-// made only for a shader that reads them.
+// made only for a shader that reads them. t39 g_fxFrames - an animation's
+// frames, a texture array the host hands over (SetFrames).
 constexpr unsigned kSceneSlot = 32;
 constexpr int kTextures = 4;
-constexpr int kViews = 1 + kTextures + 2;   // t32..t38
+constexpr int kFramesView = 1 + kTextures + 2;   // index of t39 in the views
+constexpr int kViews = kFramesView + 1;          // t32..t39
 
 bool Init(ID3D11Device* dev, LogFn log);
 // Stops the watcher, unbinds nothing (End always restores), releases all.
@@ -46,12 +57,15 @@ bool Init(ID3D11Device* dev, LogFn log);
 void Shutdown();
 
 // Compile `path` (an .hlsl with `float4 main(PSIn) : SV_Target`; #include is
-// resolved next to it) and use it from the next draw. Kept and watched: a
-// save on disk recompiles; a broken save keeps the last good shader and logs
-// the compiler's message. nullptr or "" = off.
+// resolved next to it) and use it for `target`'s draws from the next one. Kept
+// and watched: a save on disk recompiles; a broken save keeps the last good
+// shader and logs the compiler's message. nullptr or "" = off.
 // `path` is UTF-8, as every path here.
-bool Load(const char* path);
-bool Active();
+bool Load(int target, const char* path);
+bool Active();               // any target has a shader
+bool Active(int target);
+// The last compile or read failure of `target`'s file, "" after a good compile.
+void LastError(int target, char* out, unsigned cap);
 
 // The host's frame boundary (its present hook).
 void NewFrame();
@@ -71,7 +85,8 @@ void NewFrame();
 // engine's own passes of the weapon drawn with the marker material inside the
 // viewmodel runs (replace mode): only its black, which our pass no longer
 // covers where the weapon is behind the fingers.
-bool BeforeDraw(ID3D11DeviceContext* c, bool weapon);
+// `target`: whose draw it is (kNone for everything that is not marked).
+bool BeforeDraw(ID3D11DeviceContext* c, int target);
 // Every ClearDepthStencilView, BEFORE it runs, with its D3D11_CLEAR_* flags.
 // The engine clears the main depth between the world and the viewmodel run, so
 // the world's depth has to be copied here - at the run's start it is already
@@ -80,21 +95,27 @@ bool BeforeDraw(ID3D11DeviceContext* c, bool weapon);
 // `stencil`: the value the clear writes, kept for the viewmodel depth (it is
 // cleared to it instead of copied).
 void BeforeClearDepth(ID3D11DeviceContext* c, ID3D11DepthStencilView* dsv, unsigned flags, uint8_t stencil);
-// Load an image (PNG/JPG/BMP..., via WIC) into g_fxTex<index>, linear RGBA8,
-// one mip. nullptr or "" clears it. Control thread.
-bool LoadTexture(int index, const char* path);
-void SetParam(int index, float x, float y, float z, float w);
+// Load an image (PNG/JPG/BMP..., via WIC) into `target`'s g_fxTex<index>,
+// linear RGBA8, one mip. nullptr or "" clears it. Control thread.
+bool LoadTexture(int target, int index, const char* path);
+void SetParam(int target, int index, float x, float y, float z, float w);
+// An animation for `target`: `frames` is a Texture2DArray view, one slice per
+// frame, played at `fps` from the shader's start (g_fxFrames / g_fxFrameInfo
+// in weaponfx.hlsli). WeaponFX takes its own reference; nullptr clears. Any
+// thread. The host made the view on the device WeaponFX runs on; a device
+// change (Shutdown) drops it.
+bool SetFrames(int target, ID3D11ShaderResourceView* frames, float fps);
 
 // The host's original draw call, with the arguments it intercepted. Draw may
 // call it twice (a depth-only pass first), so it must not have side effects
 // beyond the draw.
 using IssueFn = void (*)(void* ctx);
-// Issues a draw BeforeDraw let through: with our shader when it is the
-// weapon's (Begin/End around it), and inside the viewmodel run against our
+// Issues a draw BeforeDraw let through: with `target`'s shader when it is a
+// marked one (Begin/End around it), and inside the viewmodel run against our
 // viewmodel depth (SetViewmodelDepth). True when our shader drew it.
 // `key`: the draw's own arguments mixed into one number by the host (0 = none),
 // only to tell an exact repeat of the previous weapon draw in the GPU cost line.
-bool Draw(ID3D11DeviceContext* c, bool weapon, IssueFn issue, void* ctx, uint64_t key = 0);
+bool Draw(ID3D11DeviceContext* c, int target, IssueFn issue, void* ctx, uint64_t key = 0);
 // Viewmodel depth (on by default). The see-through setup takes the weapon out
 // of the engine's depth passes and draws it without a depth test, so it lands
 // on top of the fingers and of its own far side. With this on, every draw of
@@ -116,12 +137,12 @@ struct Bound {
     unsigned sampleMask = 0;
     bool on = false;
 };
-// Binds our PS, constant buffer, textures and a premultiplied-alpha blend
+// Binds `target`'s PS, constant buffer, textures and a premultiplied-alpha blend
 // (out = ours.rgb + under * (1 - ours.a)), remembering theirs: an effect that
 // returns alpha 1 replaces the weapon, alpha 0 leaves what is under it.
 // Returns false (and touches nothing) when no shader is loaded or no colour
 // target is bound (the weapon's shadow-map draws).
-bool Begin(ID3D11DeviceContext* c, Bound& saved);
+bool Begin(ID3D11DeviceContext* c, int target, Bound& saved);
 void End(ID3D11DeviceContext* c, Bound& saved);
 
 // How many scene/depth copies were made so far - lets a host mark in its own
@@ -135,6 +156,14 @@ int CurrentRun();
 // (-1 = off, the normal run copies). -2 logs one frame's scene copies and our
 // draws, in order.
 void DebugDepthAt(int drawIndex);
+// Measuring switches, bit by bit (kDbg*); 0 is normal. Any thread.
+enum DebugBits : unsigned {
+    kDbgNoVmPrepass = 1,   // no depth-only pass before viewmodel draws that write no depth
+    kDbgNoTimers    = 2,   // no GPU timestamp queries
+    kDbgTraceVm     = 4,   // log the viewmodel run's draws for one frame, then clears itself
+};
+void SetDebugBits(unsigned bits);
+unsigned DebugBits();
 // Debug: every n-th frame the viewmodel is not found (0 = off) - exercises the
 // fallback to the last good scene copy that covers a detection miss.
 void DebugMissEvery(int n);

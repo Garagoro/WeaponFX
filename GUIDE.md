@@ -33,13 +33,14 @@ what it looks like, see the [README](README.md).
 
 ## Using it
 
-Only your own first-person weapon changes, and only on your screen. Other
+Only your own first-person weapon and gloves change, and only on your screen. Other
 players, spectators and demos see the normal skin. Your fingers hide the
 weapon and the weapon hides your fingers, as in the real game.
 
 ### The menu (Insert)
 
-The menu edits the weapon currently in your hands:
+The menu has two tabs: **Weapon** edits the weapon currently in your hands,
+**Gloves** your gloves. Each has its own shader, textures and parameters:
 
 - **Mode**: `replace` draws the weapon with your shader instead of its skin.
   `overlay` draws the skin first and your shader on top. `off` leaves the
@@ -49,8 +50,9 @@ The menu edits the weapon currently in your hands:
   each shader file for what it understands.
 
 Changes show up immediately. **Save to [weapon]** keeps them for this weapon
-only, **Save to [default]** for every weapon. While the menu is open the game
-gets no mouse or keyboard input.
+only, **Save to [default]** for every weapon (on the Gloves tab: this pair, or
+**[gloves]** for every pair). While the menu is open the game gets no mouse or
+keyboard input.
 
 ### weaponfx.ini
 
@@ -69,6 +71,13 @@ shader  = shaders\glass.hlsl
 
 [weapon_knife_karambit]   ; the karambit gets chrome
 shader  = shaders\chrome.hlsl
+
+[gloves]                  ; every pair of gloves without a section of its own
+mode    = replace
+shader  = shaders\galaxy.hlsl
+
+[glove_sporty]            ; Sport Gloves: a mask of their own
+tex0    = masks\sporty.png
 ```
 
 A section is named after the weapon's model. The log prints it every time you
@@ -81,6 +90,17 @@ host: weapon in hands weapons/models/awp/weapon_snip_awp.vmdl
 A weapon's section overrides `[default]` one key at a time. Skins do not
 change the model name, so one section covers every skin of that weapon.
 
+The gloves work the same way, with `[gloves]` instead of `[default]`. A pair's
+section is named after the glove's folder in the game, and the log prints it
+when the gloves in your hands change:
+
+```
+host: gloves in hands characters/models/shared/arms/glove_sporty
+```
+
+Your arms and sleeves are left alone. A shader can tell which of the two it is
+drawing with `IsGloves()`, so one file can serve both.
+
 <details>
 <summary>All keys</summary>
 
@@ -88,9 +108,9 @@ change the model name, so one section covers every skin of that weapon.
 |---|---|
 | `mode` | `replace`, `overlay` or `off` |
 | `shader` | path to the `.hlsl`, relative to the data folder or absolute |
-| `tex0` .. `tex3` | images the shader samples by the weapon's UV (`g_fxTex0..3`) |
+| `tex0` .. `tex3` | images the shader samples by the weapon's UV (`g_fxTex0..3`). On gloves whose right hand reads the texture mirrored (Sport, Slick, Specialist), a mask twice as wide as tall holds the left hand in its left half and the right hand in its right half; `Tex0(i)` picks the half |
 | `param0` .. `param3` | four numbers each, read as `g_fxParam[0..3]` |
-| `vmdepth` | `1` (default): hands and weapon hide each other correctly. Leave it on |
+| `vmdepth` | `1` (default): hands and weapon hide each other correctly. Leave it on. Read from the weapon's sections only |
 
 The data folder can be moved by setting the `WEAPONFX_DIR` environment
 variable for the game. Paths may contain any characters. Save the file as
@@ -166,11 +186,11 @@ finds the compiler itself. The project builds with warnings as errors at
 ## Limits
 
 - DirectX 11 only, the game's default on Windows. Vulkan is not supported.
-- Only the weapon in your hands: not other players' weapons, not weapons on
-  the ground, not your hands or gloves.
-- One shader at a time. Switching to a weapon with a different shader
-  recompiles, and the first frames of the new weapon may still show the old
-  effect.
+- Only the weapon in your hands and your gloves: not other players' weapons,
+  not weapons on the ground, not your bare arms or sleeves.
+- One shader per target (the weapon, the gloves). Switching to a weapon with a
+  different shader recompiles, and the first frames of the new weapon may
+  still show the old effect.
 - After changing the display mode, reload the DLL.
 
 ## When a game update breaks it
@@ -201,10 +221,35 @@ changing the core.
 | `core/weapon_fx.{h,cpp}` | the effect itself: compiling and watching shaders, finding the viewmodel, the world and depth copies, our draw. DirectX 11 and Win32 only, no knowledge of the game |
 | `host/patch` | signature scans, detours, code writes with other threads paused |
 | `host/d3d_hooks` | `Present`, the DirectX 11 draw calls, `ClearDepthStencilView`; recognising the weapon's draws by the marker |
-| `host/engine` | the game's `RenderObjects`: the weapon out of the depth passes and drawn with the marker; which weapon is in hands |
-| `host/material` | creating the marker material |
+| `host/engine` | the game's `RenderObjects`: the weapon and the gloves out of the depth passes and drawn with their markers; which weapon and gloves are in hands |
+| `host/material` | creating the marker materials, one per target |
 | `host/config` | reading and watching `weaponfx.ini` |
-| `host/menu` | the in-game menu |
+| `host/panel` | the settings panel, drawn into any ImGui window |
+| `host/menu` | the in-game menu: input, the ImGui context, the window around the panel |
 | `host/dllmain.cpp` | start-up, the per-frame driver, unloading in order |
 | `shaders/` | the shared headers and the effects |
+</details>
+
+<details>
+<summary>Embedding WeaponFX in another tool</summary>
+
+A host that already hooks `Present` and the game's `RenderObjects` (a second
+detour on the same prologue would be refused by the signature check) does not
+use `host/dllmain.cpp` and `host/menu.cpp`. It compiles the core and the other
+host parts, and:
+
+- once: `Wfx::SetLogSink(fn)` and `Wfx::SetDataDir(dir)` for its own log and
+  folder, then a control thread that calls `Wfx::Config::Tick()` (under the
+  same lock as `WeaponFx::Init/Shutdown`);
+- in its `Present`: `WeaponFx::Init(device, log)` on a new device,
+  `Wfx::D3d::HookDraws(device)`, the markers (`Material::Marker(target)` once
+  `Engine::Model(target)` is known, `Material::MarkerViews` into
+  `D3d::SetMarkerViews`), then `WeaponFx::NewFrame()`;
+- in its `RenderObjects` detour, first: `Engine::Attach(itemStride)` once, then
+  `if (Engine::Handle(orig, ..., &r)) return r;`;
+- `Panel::Draw()` inside one of its ImGui windows, with `Panel::SetTranslator`
+  for its UI language and `Panel::SetTexExtra` for a button next to each
+  texture slot;
+- at unload: the `Handle` calls stop, `D3d::ClearMarkerViews()`,
+  `D3d::RemoveDraws()`, the control thread ends, `WeaponFx::Shutdown()`.
 </details>

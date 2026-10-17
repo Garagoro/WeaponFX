@@ -31,7 +31,7 @@ std::atomic<bool> g_FxReady{false};
 std::atomic<ID3D11Device*> g_Device{nullptr};   // compared, the swap chain owns it
 HMODULE g_Self = nullptr;
 std::atomic<bool> g_EngineOn{false};
-unsigned g_ModelSerial = 0;   // render thread only
+unsigned g_ModelSerial[WeaponFx::kTargets] = {};   // render thread only
 // WeaponFX's Init/Shutdown (render thread, on a device change) against the
 // config applying shaders and textures (control thread).
 SRWLOCK g_FxLock = SRWLOCK_INIT;
@@ -62,25 +62,27 @@ void OnFrame(IDXGISwapChain* sc, ID3D11Device* dev) {
     }
     Wfx::D3d::HookDraws(dev);
     if (g_EngineOn.load(std::memory_order_acquire)) {
-        char model[260];
-        unsigned serial = 0;
-        Wfx::Engine::WeaponModel(model, sizeof(model), &serial);
-        if (serial != g_ModelSerial) {
-            g_ModelSerial = serial;
-            Wfx::Log("host: weapon in hands %s", model);
-            if (g_Wake) SetEvent(g_Wake);
+        for (int t = 0; t < WeaponFx::kTargets; ++t) {
+            char model[260];
+            unsigned serial = 0;
+            Wfx::Engine::Model(t, model, sizeof(model), &serial);
+            if (serial != g_ModelSerial[t]) {
+                g_ModelSerial[t] = serial;
+                Wfx::Log("host: %s in hands %s", t == WeaponFx::kGloves ? "gloves" : "weapon", model);
+                if (g_Wake) SetEvent(g_Wake);
+            }
+            // Created here, not on the scenesystem workers that use it: one
+            // thread owns the attempt. Not before the target was seen in
+            // hands: in the main menu the marker's texture does not resolve and
+            // the material came out with the engine's error texture (on the
+            // weapon, and its views shared with every other missing texture).
+            if (serial && Wfx::Engine::GetMode(t) != Wfx::Engine::Mode::Off) Wfx::Material::Marker(t);
+            // Re-read every frame: the engine may swap the views when it streams.
+            ID3D11ShaderResourceView* a = nullptr;
+            ID3D11ShaderResourceView* b = nullptr;
+            Wfx::Material::MarkerViews(t, &a, &b);
+            Wfx::D3d::SetMarkerViews(t, a, b);
         }
-        // Created here, not on the scenesystem workers that use it: one
-        // thread owns the attempt. Not before a weapon was seen in hands: in
-        // the main menu the marker's texture does not resolve and the material
-        // came out with the engine's error texture (on the weapon, and its
-        // views shared with every other missing texture).
-        if (serial) Wfx::Material::Marker();
-        // Re-read every frame: the engine may swap the views when it streams.
-        ID3D11ShaderResourceView* a = nullptr;
-        ID3D11ShaderResourceView* b = nullptr;
-        Wfx::Material::MarkerViews(&a, &b);
-        Wfx::D3d::SetMarkerViews(a, b);
     }
     if (g_FxReady.load(std::memory_order_relaxed)) WeaponFx::NewFrame();
     // Last: drawn over the finished frame, right before the game presents it.
@@ -113,7 +115,7 @@ void Teardown() {
                  noRoom);
         Wfx::Engine::Remove();
     }
-    Wfx::D3d::SetMarkerViews(nullptr, nullptr);
+    Wfx::D3d::ClearMarkerViews();
     Wfx::D3d::RemoveDraws();
     Wfx::D3d::RemovePresent();
     Wfx::Menu::Shutdown();

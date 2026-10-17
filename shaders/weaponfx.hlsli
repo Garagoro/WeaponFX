@@ -30,9 +30,10 @@ SamplerState     g_linear   : register(s0);
 
 // WeaponFX's own buffer (weapon_fx.cpp, FxConstants).
 cbuffer WeaponFx : register(b13) {
-    float4 g_fxTime;       // x seconds since load, y delta to previous draw, z draw counter
+    float4 g_fxTime;       // x seconds since load, y delta to previous draw, z draw counter, w target (0 weapon, 1 gloves)
     float4 g_fxScreen;     // xy viewport size in pixels, zw 1/size
     float4 g_fxParam[4];   // param0..param3 in weaponfx.ini
+    float4 g_fxFrameInfo;  // x frame count (0: no frames), y frames per second
 };
 
 // WeaponFX's textures (weapon_fx.h kSceneSlot). g_fxScene is the frame as it
@@ -50,8 +51,17 @@ Texture2D<float> g_fxDepth : register(t37);
 // pure black: the copy taken at a wrong moment (the world not drawn yet under
 // the weapon) shows as a frame-old background instead of a black blink.
 Texture2D g_fxScenePrev : register(t38);
+// An animation's frames, one slice each, set by the host (the skin editor's
+// animated layers); none in the standalone DLL. FrameNow() is the slice due.
+Texture2DArray g_fxFrames : register(t39);
 
 float  Time()            { return g_fxTime.x; }
+bool   HasFrames()       { return g_fxFrameInfo.x > 0.5; }
+// The frame due now, looping from the shader's start.
+float  FrameNow()        { return fmod(floor(Time() * g_fxFrameInfo.y), max(g_fxFrameInfo.x, 1.0)); }
+// The same file can be loaded for the weapon and for the gloves; this says
+// which one the draw is.
+bool   IsGloves()        { return g_fxTime.w > 0.5; }
 float3 WorldPos(PSIn i)  { return i.pos + g_l3[35].xyz; }
 float3 CameraPos()       { return g_view[26].xyz; }
 // From the eye to this pixel, world space, normalised.
@@ -127,10 +137,26 @@ float FocalPx()        { return 0.5 * g_fxScreen.y * g_view[13].y; }
 float PixelDistance(PSIn i) { return length(i.pos); }
 bool  HasTex0()        { float w, h; g_fxTex0.GetDimensions(w, h); return w > 0.0; }
 
-// A mask texture by the weapon's first UV set. Texture index is a literal in
+// Where a mask of `w` x `h` texels is read for this pixel. On the weapon: its
+// first UV set as it is. On the gloves the game puts the right hand's U in
+// [-1, 0] and wraps it, so both hands read one 0..1 picture; a mask twice as
+// wide as tall holds the hands side by side instead - left hand in the left
+// half, right in the right - which is how the skin editor lays out a pair. A
+// square mask is read by both hands, the way the game's own glove skin is.
+float2 MaskUV(PSIn i, float w, float h) {
+    float2 uv = i.uv.xy;
+    if (!IsGloves()) return uv;
+    float u = frac(uv.x);
+    if (w > h * 1.5) u = uv.x < 0.0 ? 0.5 + 0.5 * u : 0.5 * u;
+    return float2(u, uv.y);
+}
+
+// A mask texture by the first UV set (MaskUV). Texture index is a literal in
 // the caller (HLSL cannot index separate Texture2D objects).
-float4 Tex0(PSIn i) { return g_fxTex0.Sample(g_linear, i.uv.xy); }
-float4 Tex1(PSIn i) { return g_fxTex1.Sample(g_linear, i.uv.xy); }
+float4 Tex0(PSIn i) { float w, h; g_fxTex0.GetDimensions(w, h); return g_fxTex0.Sample(g_linear, MaskUV(i, w, h)); }
+float4 Tex1(PSIn i) { float w, h; g_fxTex1.GetDimensions(w, h); return g_fxTex1.Sample(g_linear, MaskUV(i, w, h)); }
+float4 Tex2(PSIn i) { float w, h; g_fxTex2.GetDimensions(w, h); return g_fxTex2.Sample(g_linear, MaskUV(i, w, h)); }
+float4 Tex3(PSIn i) { float w, h; g_fxTex3.GetDimensions(w, h); return g_fxTex3.Sample(g_linear, MaskUV(i, w, h)); }
 
 // Hashes and noise: integer-free so they compile the same on every driver.
 float  Hash13(float3 p) { p = frac(p * 0.1031); p += dot(p, p.zyx + 31.32); return frac((p.x + p.y) * p.z); }

@@ -118,7 +118,23 @@ two SRVs) **[fragile]**: the engine may swap them while it streams.
 
 Which items are the weapon, in `RenderObjects`: the ones whose material's
 shader is `csgo_weapon.vfx`. Arms, sleeves and gloves are
-`csgo_character.vfx`. Which weapon it is comes from the item's scene object,
+`csgo_character.vfx`, and all three are items of ONE scene object - the
+agent's model (`agents/models/ctm_sas/ctm_sas.vmdl`), so the model path cannot
+tell the gloves from the bare arm. The material name can: the glove's is
+`characters/models/shared/arms/glove_<kind>/materials/....vmat` (the name from
+the material's vtable slot 0, read under SEH) **[fragile: the folder naming]**.
+WeaponFX takes `csgo_character.vfx` items whose name has `/arms/glove_`, and
+the folder up to the next `/` is the "model" the settings section is named
+after. Gloves with a skin on are the other way round: a composite
+material (`compmat_1.vmat`) on a scene object of their own
+(`agents/models/shared/arms/glove_sporty/glove_sporty.vmdl`), so the model
+path is checked too. The gloves get a marker of their own (`gray_grid_8_color`), so one
+`PSSetShaderResources` tells which of the two programs a draw belongs to.
+
+Shader class and glove-ness are cached per material pointer. Materials sit on
+2 KB boundaries, so the low bits of the pointer are all zero; the cache slot is
+a multiplicative hash of the pointer, not its low bits - with the low bits
+every material landed in a handful of slots and the cache thrashed. Which weapon it is comes from the item's scene object,
 not its material - with a skin on, the material is a composite
 (`compmat_27.vmat`): scene object `+0x110` -> `+0xB8` -> the model path
 (`weapons/models/awp/weapon_snip_awp.vmdl`) **[fragile; found by scanning,
